@@ -1,0 +1,39 @@
+# CI: the network-free tests, the public-safety scan and the Worker's build on every push and pull request. The fork
+# suite (the whole flow on a local fork of Robinhood Chain, through the CLI) runs too; it needs the public Robinhood
+# Chain RPC to answer.
+name: ci
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the safety scan reads the whole history
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm ci
+      - run: npm test
+      - run: npm run safety
+      - run: npm run worker:dry-run
+  fork:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: foundry-rs/foundry-toolchain@v1
+      - run: npm ci
+      - run: npm run test:fork
