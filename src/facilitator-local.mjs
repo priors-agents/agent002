@@ -43,12 +43,21 @@ export function ethersFacilitatorSigner(wallet) {
   };
 }
 
-/** A FacilitatorClient (verify, settle, getSupported) that settles in-process on the fork. */
+/**
+ * A FacilitatorClient (verify, settle, getSupported) that settles in-process on the fork. Settlements go one at a
+ * time: they all send from the one fork-only wallet, and two at once would take the same nonce (three workers sell
+ * at the same time, which agent001's single service never did).
+ */
 export function localFacilitator(wallet) {
   const f = new x402Facilitator().register(robinhood.network, new ExactEvmScheme(ethersFacilitatorSigner(wallet)));
+  let tail = Promise.resolve();
   return {
     verify: (payload, requirements) => f.verify(payload, requirements),
-    settle: (payload, requirements) => f.settle(payload, requirements),
+    settle(payload, requirements) {
+      const run = tail.then(() => f.settle(payload, requirements));
+      tail = run.catch(() => {});
+      return run;
+    },
     getSupported: async () => f.getSupported(),
   };
 }

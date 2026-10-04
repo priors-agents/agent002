@@ -499,6 +499,7 @@ export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox
         finishedAt: j.finishedAt ?? null,
         minutesBought: j.minutes,
         minutesUsed: started !== null && finished !== null ? Math.round(((finished - started) / 60_000) * 100) / 100 : null,
+        secondsUsed: started !== null && finished !== null ? Math.round((finished - started) / 100) / 10 : null,
         modelSpendUsd: j.modelSpendUsd ?? 0,
         model: j.model ?? settings.model,
         steps: j.steps ?? null,

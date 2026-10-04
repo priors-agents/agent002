@@ -13,6 +13,7 @@
 //   - its hash has never paid for a job before (the service keeps every used hash, forever).
 //
 // judgePriorsTransfer() is the rules, a pure function; readPriorsTransfer() reads what they need from a JSON-RPC node.
+import { getAddress } from "ethers";
 import { TRANSFER_TOPIC, sameAddress, isTxHash } from "./chain.mjs";
 import { hexToNumber } from "./rpc.mjs";
 import { formatAtomic } from "./money.mjs";
@@ -28,7 +29,7 @@ export class PaymentRefused extends Error {
   }
 }
 
-const topicAddress = (t) => (typeof t === "string" && t.length === 66 ? "0x" + t.slice(26) : null);
+const topicAddress = (t) => (typeof t === "string" && t.length === 66 ? getAddress("0x" + t.slice(26)) : null);
 
 /** Every ERC-20 Transfer event in a receipt: { token, from, to, value }. */
 export function transfersIn(receipt) {
@@ -38,7 +39,7 @@ export function transfersIn(receipt) {
     if (!Array.isArray(l.topics) || l.topics.length !== 3 || String(l.topics[0]).toLowerCase() !== TRANSFER_TOPIC) continue;
     let value;
     try { value = BigInt(l.data); } catch (_) { continue; }
-    out.push({ token: l.address, from: topicAddress(l.topics[1]), to: topicAddress(l.topics[2]), value });
+    out.push({ token: getAddress(l.address), from: topicAddress(l.topics[1]), to: topicAddress(l.topics[2]), value });
   }
   return out;
 }
@@ -92,7 +93,7 @@ export function judgePriorsTransfer({ tx, receipt, latestBlock, blockTime, token
   if (confirmations < minConfirmations) {
     throw new PaymentRefused("confirmations", `the transaction has ${confirmations} confirmation(s); ${minConfirmations} are needed: try again in a few seconds`, { status: 409, retry: true });
   }
-  return { payer: tx.from, amount, blockNumber, blockTime, confirmations };
+  return { payer: getAddress(tx.from), amount, blockNumber, blockTime, confirmations };
 }
 
 const iso = (s) => new Date(s * 1000).toISOString();
