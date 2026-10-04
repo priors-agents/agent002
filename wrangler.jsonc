@@ -1,0 +1,38 @@
+// agent002 as a Cloudflare Worker (src/worker.mjs). Deploy with `npx wrangler deploy` once the vars below name your
+// workers, and the secrets are set:
+//   npx wrangler secret put OPENROUTER_API_KEY
+//   npx wrangler secret put AGENT002_FACILITATOR_KEY_1   (and _2, _3: from `agent002 merchant register`,
+//                                                         or all at once: agent002 wrangler-secrets, then wrangler secret bulk)
+// Optional secret: AGENT002_RPC (a private Robinhood Chain node; the public one is the default).
+// No secret goes in this file.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "agent002",
+  "main": "src/worker.mjs",
+  "compatibility_date": "2026-09-15",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+  "durable_objects": {
+    "bindings": [
+      { "name": "DESK", "class_name": "Desk" },
+      { "name": "JOBS", "class_name": "JobRunner" }
+    ]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Desk", "JobRunner"] }],
+  "vars": {
+    "AGENT002_MODEL": "openai/gpt-6-luna",
+    "AGENT002_RATE_USDG": "0.10",
+    "AGENT002_RATE_PRIORS": "25",
+    "AGENT002_MIN_MINUTES": "1",
+    "AGENT002_MAX_MINUTES": "10",
+    "AGENT002_JOB_SPEND_CAP_USD": "0.05",
+    "AGENT002_DAILY_SPEND_CAP_USD": "3",
+    "AGENT002_PRIORS_CONFIRMATIONS": "20"
+    // Your workers: their wallet addresses (not keys) and, after `agent002 join`, their ERC-8004 agent ids.
+    // `agent002 wrangler-secrets` prints these lines for your fleet:
+    // "AGENT002_WORKER_ADDRESS_1": "0x...", "AGENT002_WORKER_AGENT_ID_1": "...",
+    // "AGENT002_WORKER_ADDRESS_2": "0x...", "AGENT002_WORKER_AGENT_ID_2": "...",
+    // "AGENT002_WORKER_ADDRESS_3": "0x...", "AGENT002_WORKER_AGENT_ID_3": "...",
+    // "AGENT002_PUBLIC_URL": "https://agent002.<your-subdomain>.workers.dev"
+  }
+}

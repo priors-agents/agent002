@@ -55,7 +55,8 @@ const AUTHORIZATION_STATE = "0xe94a0102";
  * @param {object} o.settings        src/settings.mjs
  * @param {object} o.store           src/store.mjs interface
  * @param {{ start(job, hooks): Promise<void>|void }} o.runner
- * @param {(worker) => { verify, settle }} o.facilitatorFor   the x402 facilitator that settles payments to this worker
+ * @param {(worker) => { verify, settle }|null} o.facilitatorFor   the x402 facilitator that settles payments to this
+ *                                   worker; null when none does (no API key): that worker is not offered for USDG
  * @param {(method, params) => Promise<any>} o.rpc            Robinhood Chain JSON-RPC (src/rpc.mjs)
  * @param {boolean} [o.sandbox]      a local fork: record links go by wallet
  */
@@ -93,6 +94,7 @@ export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox
       payment: [
         {
           token: "USDG", asset: USDG.address, decimals: USDG.decimals, method: "x402", x402Version: 2, scheme: "exact", network: NETWORK,
+          available: workers.some((w) => !!facilitatorFor(w)),
           transfer: "EIP-3009 transferWithAuthorization, signed by the buyer and settled by the facilitator",
           payer: "an EOA: the facilitator settles only EIP-3009 signatures from a plain key (no smart-contract wallets)",
           how: "POST /jobs {minutes, task} -> 402 whose PAYMENT-REQUIRED asks minutes x rate USDG to the assigned worker's wallet -> send the same request with PAYMENT-SIGNATURE",
@@ -116,13 +118,17 @@ export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox
 
   // ---- quotes ----------------------------------------------------------------------------------------------------
 
-  /** Assign a worker and record a quote, inside the lock. Refuses (503) when the day's model budget is spent. */
-  async function newQuote(fields) {
+  /**
+   * Assign a worker and record a quote, inside the lock. Refuses (503) when the day's model budget is spent, and when
+   * no worker can take this payment (`eligible`: for USDG, a worker the facilitator settles for).
+   */
+  async function newQuote(fields, eligible = () => true) {
     return lock(async () => {
       checkCanTakeJob(await store.get("ledger"), caps, now()); // throws DailyCapReached: no quote, no 402
       const fleet = await getFleet();
-      const load = Object.fromEntries(workers.map((w) => [w.id, counters(fleet, w.id).active]));
+      const load = Object.fromEntries(workers.map((w) => [w.id, eligible(w) ? counters(fleet, w.id).active : Infinity]));
       const i = pickWorker(workers, load, fleet.last);
+      if (i < 0) throw Object.assign(new Error("USDG over x402 is not set up on this service (no facilitator API key): pay in PRIORS (POST /quote)"), { status: 503, code: "usdg_unavailable" });
       fleet.last = i;
       const w = workers[i];
       const t = now();
@@ -188,7 +194,7 @@ export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox
   async function usdgQuote({ minutes, taskHash, resource }) {
     const amount = priceFor(minutes, settings.rateUsdgAtomic);
     await prune();
-    const { quote, worker } = await newQuote((t) => ({ method: "x402", token: "USDG", minutes, amount: amount.toString(), taskHash, expiresAt: t + settings.x402QuoteSeconds * 1000 }));
+    const { quote, worker } = await newQuote((t) => ({ method: "x402", token: "USDG", minutes, amount: amount.toString(), taskHash, expiresAt: t + settings.x402QuoteSeconds * 1000 }), (w) => !!facilitatorFor(w));
     const requirement = requirementFor(quote, { maxTimeoutSeconds: settings.x402QuoteSeconds });
     const pr = paymentRequired({
       requirement,
@@ -232,6 +238,10 @@ export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox
     const { quote, requirement, jobId } = claim;
     const worker = byId.get(quote.workerId);
     const facilitator = facilitatorFor(worker);
+    if (!facilitator) {
+      await reopen(quote, jobId, "open");
+      throw Object.assign(new Error(`worker ${worker.id} cannot settle USDG here (no facilitator API key): nothing was charged`), { status: 503, code: "usdg_unavailable" });
+    }
     let settlement = null, payer = null;
 
     // a settlement whose outcome was unknown: if the authorization was used on chain, the payment landed
@@ -276,7 +286,7 @@ export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox
       return j;
     });
     log?.info?.(`job ${job.id}: paid ${formatAtomic(job.payment.amount, USDG.decimals)} USDG to ${worker.id} (tx ${job.payment.txHash}), queued`);
-    void dispatch();
+    await dispatch(); // hands the job to its runner (in a Worker, a Durable Object RPC): quick, and done before answering
     return json(201, jobView(job), { "payment-response": encodeSettlement({ success: true, transaction: job.payment.txHash || "", network: job.payment.network, payer: job.payment.payer }) });
   }
 
@@ -347,7 +357,7 @@ export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox
       return j;
     });
     log?.info?.(`job ${job.id}: paid ${formatAtomic(job.payment.amount, PRIORS.decimals)} PRIORS to ${job.workerId} (tx ${txHash}), queued`);
-    void dispatch();
+    await dispatch(); // hands the job to its runner (in a Worker, a Durable Object RPC): quick, and done before answering
     return json(201, jobView(job));
   }
 
@@ -543,7 +553,8 @@ export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox
       if (m && request.method === "GET") return await getJob(m[1]);
       return json(404, { error: "not found: see GET /manifest", code: "not_found" });
     } catch (e) {
-      const expected = (e?.status >= 400 && e.status < 500) || e instanceof DailyCapReached || e?.status === 502;
+      // every refusal this service makes carries a code and an HTTP status; anything else is a 500
+      const expected = typeof e?.code === "string" && Number.isInteger(e?.status) && e.status >= 400 && e.status < 600;
       if (expected) {
         const headers = e?.retry ? { "retry-after": "3" } : {};
         return json(e.status || 400, { error: redact(e.message), code: e.code || "error", ...(e.retry ? { retry: true } : {}) }, headers);

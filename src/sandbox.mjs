@@ -2,12 +2,14 @@
 // agent001. Nothing here can touch mainnet: anvil forks the chain lazily and every write stays on the local node. On
 // the fork only:
 //   - each worker's wallet gets 1 ETH for gas (to register its identity with `agent002 join`);
-//   - a fork-only facilitator wallet settles the x402 USDG payments (src/facilitator-local.mjs), paying the gas;
+//   - a fork-only facilitator wallet settles the x402 USDG payments (src/facilitator-local.mjs), paying the gas, in
+//     process for `agent002 serve` and over HTTP for a Cloudflare Worker under `wrangler dev`;
 //   - `agent002 fund <address>` gives a buyer ETH, USDG and PRIORS (written into the tokens' storage).
 // The fork mines a block every second as well as on each transaction (anvil --block-time 1 --mixed-mining), so a
 // PRIORS payment gathers confirmations as it would on the chain, and the fork's clock keeps up with the wall clock
 // (an x402 authorization is signed against the buyer's clock).
 import { spawn } from "node:child_process";
+import { createServer } from "node:http";
 import { ethers } from "ethers";
 import { USDG, PRIORS } from "./chain.mjs";
 import { ERC20_ABI, makeProvider, isSandbox } from "./eth.mjs";
@@ -87,4 +89,26 @@ export async function fund(provider, address, { eth = 1, usdg = 20, priors = 100
   await provider.send("anvil_setBalance", [address, ethers.toBeHex(ethers.parseEther(String(eth)))]);
   await dealErc20(provider, USDG.address, address, ethers.parseUnits(String(usdg), USDG.decimals));
   await dealErc20(provider, PRIORS.address, address, ethers.parseUnits(String(priors), PRIORS.decimals));
+}
+
+/**
+ * The fork-only facilitator over HTTP, in the wire format of x402's HTTPFacilitatorClient (POST /verify, POST /settle,
+ * GET /supported), so a service that settles through a facilitator URL can settle on the fork: the Cloudflare Worker
+ * under `wrangler dev`, with AGENT002_FACILITATOR_URL pointed here. Fork only, on 127.0.0.1, no key.
+ */
+export function serveFacilitator(facilitator, port) {
+  const server = createServer(async (req, res) => {
+    const send = (status, body) => { res.writeHead(status, { "content-type": "application/json" }); res.end(JSON.stringify(body)); };
+    try {
+      if (req.method === "GET" && req.url === "/supported") return send(200, await facilitator.getSupported());
+      if (req.method !== "POST" || !["/verify", "/settle"].includes(req.url)) return send(404, { error: "not found" });
+      let raw = "";
+      for await (const c of req) { raw += c; if (raw.length > 64 * 1024) return send(413, { error: "too large" }); }
+      const { paymentPayload, paymentRequirements } = JSON.parse(raw);
+      return send(200, req.url === "/verify" ? await facilitator.verify(paymentPayload, paymentRequirements) : await facilitator.settle(paymentPayload, paymentRequirements));
+    } catch (e) {
+      return send(500, { error: String(e?.message || e).slice(0, 300) });
+    }
+  });
+  return new Promise((resolve, reject) => { server.once("error", reject); server.listen(port, "127.0.0.1", () => resolve(server)); });
 }

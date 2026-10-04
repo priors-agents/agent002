@@ -8,7 +8,7 @@ import { createWorkers, loadWorkerFile, signerOf } from "./workers.mjs";
 import { makeContext } from "./context.mjs";
 import { PUBLIC_RPC, USDG, PRIORS, recordLink } from "./chain.mjs";
 import { ERC20_ABI } from "./eth.mjs";
-import { startFork, setUpSandbox, fund } from "./sandbox.mjs";
+import { startFork, setUpSandbox, fund, serveFacilitator } from "./sandbox.mjs";
 import { register, ownerOf, registrationUri } from "./join.mjs";
 import { registerMerchant } from "./merchant.mjs";
 import { localFacilitator } from "./facilitator-local.mjs";
@@ -81,9 +81,11 @@ export const commands = {
     try {
       rmSync(pathOf(home, "sandbox-state.json"), { force: true }); // a new fork: no jobs or used transactions from the last one
       const s = await setUpSandbox(fork.provider, { home, rpc: fork.rpc, workers });
+      const facPort = Number(a.port || 8545) + 2;
+      await serveFacilitator(localFacilitator(new ethers.Wallet(readJson(pathOf(home, "sandbox.json")).facilitatorKey, fork.provider)), facPort);
       out(`sandbox ready on ${fork.rpc}: a fork of Robinhood Chain at block ${await fork.provider.getBlockNumber()}, a block every second.`);
       for (const w of workers) out(`  worker ${w.id} ${w.address} got 1 ETH for gas (play money, on this fork only)`);
-      out(`a fork-only facilitator (${s.facilitator}) settles x402 payments on the fork.`);
+      out(`a fork-only facilitator (${s.facilitator}) settles x402 payments on the fork: in process for agent002 serve, and on http://127.0.0.1:${facPort} for a Worker under wrangler dev (AGENT002_FACILITATOR_URL).`);
       out("Next: agent002 join · agent002 serve · agent002 fund <buyer address> for play USDG and PRIORS. Ctrl-C stops it.");
     } catch (e) { stop(); throw e; }
     await new Promise(() => {}); // keep anvil alive until Ctrl-C

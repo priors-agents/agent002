@@ -82,13 +82,13 @@ function fakeChain() {
   };
 }
 
-function setup(over = {}, { modelFor = async () => stubModel() } = {}) {
+function setup(over = {}, { modelFor = async () => stubModel(), facilitatorFor = null } = {}) {
   const settings = settingsFromEnv(env(over));
   const facilitator = fakeFacilitator();
   const chain = fakeChain();
   const store = memoryStore();
   const toolbox = () => ({ defs: async () => [], run: async () => ({ text: "", isError: true }) });
-  const desk = makeDesk({ settings, store, runner: localRunner({ settings, toolbox, modelFor }), facilitatorFor: () => facilitator, rpc: chain.rpc, sandbox: false });
+  const desk = makeDesk({ settings, store, runner: localRunner({ settings, toolbox, modelFor }), facilitatorFor: facilitatorFor ? (w) => facilitatorFor(w, facilitator) : () => facilitator, rpc: chain.rpc, sandbox: false });
   const call = (method, path, body, headers = {}) => desk.handle(new Request(`http://agent002.test${path}`, { method, headers: { "content-type": "application/json", ...headers }, body: body === undefined ? undefined : JSON.stringify(body) }));
   return { settings, facilitator, chain, store, desk, call };
 }
@@ -361,4 +361,39 @@ test("refusals: bad minutes, an empty task, a non-JSON body, an unknown job, a q
   const opt = await call("OPTIONS", "/jobs");
   assert.equal(opt.status, 204);
   assert.match(opt.headers.get("access-control-allow-headers"), /payment-signature/);
+});
+
+test("USDG needs a facilitator: a worker without one is never named in a 402; with none at all, 503 and no 402", async () => {
+  const only3 = setup({}, { facilitatorFor: (w, f) => (w.id === "w3" ? f : null) });
+  for (let i = 0; i < 3; i++) {
+    const r = await only3.call("POST", "/jobs", { minutes: 1, task: `t${i}` });
+    assert.equal(r.status, 402);
+    assert.equal(decodePaymentRequiredHeader(r.headers.get("payment-required")).accepts[0].payTo, W[2].address);
+  }
+  const none = setup({}, { facilitatorFor: () => null });
+  const r = await none.call("POST", "/jobs", { minutes: 1, task: "t" });
+  assert.equal(r.status, 503);
+  assert.equal(r.headers.get("payment-required"), null);
+  assert.equal((await r.json()).code, "usdg_unavailable");
+  assert.equal((await (await none.call("GET", "/manifest")).json()).payment[0].available, false);
+  // PRIORS still works without any facilitator
+  assert.equal((await none.call("POST", "/quote", { minutes: 1, payer: W[0].address })).status, 200);
+});
+
+test("a facilitator that fails mid-verification leaves no stuck quote and no held budget: the same payment can be sent again", async () => {
+  let down = true;
+  const { call, store, facilitator } = setup({}, { facilitatorFor: (w, f) => ({ verify: async (p, r) => { if (down) throw new TypeError("fetch failed"); return f.verify(p, r); }, settle: (p, r) => f.settle(p, r) }) });
+  const buyer = ethers.Wallet.createRandom();
+  const job = { minutes: 1, task: "retry me" };
+  const req = decodePaymentRequiredHeader((await call("POST", "/jobs", job)).headers.get("payment-required")).accepts[0];
+  const signature = await sign(buyer, req);
+  const r1 = await call("POST", "/jobs", job, { "payment-signature": signature });
+  assert.equal(r1.status, 502);
+  assert.equal((await r1.json()).code, "facilitator_error");
+  assert.deepEqual((await store.get("ledger")).reserved, {});
+  assert.equal((await store.get(`quote:${req.extra.quote}`)).status, "open");
+  down = false;
+  const r2 = await call("POST", "/jobs", job, { "payment-signature": signature });
+  assert.equal(r2.status, 201);
+  assert.equal(facilitator.settled.length, 1);
 });
