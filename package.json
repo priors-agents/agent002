@@ -1,0 +1,34 @@
+{
+  "name": "agent002",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A fleet of three worker agents that sell their time by the minute on Robinhood Chain: paid in USDG over x402 or in PRIORS by transfer, each payment landing in the wallet of the worker that does the job.",
+  "type": "module",
+  "bin": {
+    "agent002": "bin/agent002.mjs"
+  },
+  "scripts": {
+    "test": "node --test --test-concurrency=1 test/*.test.mjs",
+    "test:fork": "node --test --test-concurrency=1 test/fork/*.test.mjs",
+    "safety": "node scripts/public-safety.mjs",
+    "worker:dry-run": "wrangler deploy --dry-run --outdir dist-worker"
+  },
+  "engines": {
+    "node": ">=20.18"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/priors-agents/agent002",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/priors-agents/agent002.git"
+  },
+  "dependencies": {
+    "@priors/x402": "0.2.10",
+    "@x402/core": "~2.28.0",
+    "@x402/evm": "~2.28.0",
+    "ethers": "^6.13.4"
+  },
+  "devDependencies": {
+    "wrangler": "^4.147.0"
+  }
+}

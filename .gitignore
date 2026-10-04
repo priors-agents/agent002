@@ -1,0 +1,10 @@
+node_modules/
+# agent002's own folder: the worker keys, the facilitator API keys, the job state. Never commit it.
+.agent002/
+.env
+.env.*
+.dev.vars
+*.log
+# wrangler's build output and local state
+dist-worker/
+.wrangler/
