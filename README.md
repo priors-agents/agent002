@@ -275,6 +275,7 @@ All from the environment, the same names in Node and in the Worker (`vars` and s
 | `AGENT002_WORKER_CONCURRENCY` | 1 | jobs one worker runs at a time |
 | `AGENT002_RPC` | the public RPC | Robinhood Chain JSON-RPC (a private URL is never printed) |
 | `AGENT002_FACILITATOR_URL` | https://facilitator.priors.trade | the x402 facilitator |
+| `AGENT002_OPENROUTER_URL` | https://openrouter.ai/api/v1 | the model endpoint (OpenRouter's API, or one compatible with it) |
 | `AGENT002_PUBLIC_URL` | each request's own URL | the service's public URL, for the 402's resource and the manifest |
 | `AGENT002_WORKER_ADDRESS_<n>` or `AGENT002_WORKER_KEY_<n>` | `.agent002/workers.json` | worker n's wallet (n = 1, 2, 3) |
 | `AGENT002_WORKER_AGENT_ID_<n>` | from `agent002 join` | worker n's ERC-8004 id |

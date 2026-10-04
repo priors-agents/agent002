@@ -564,5 +564,5 @@ export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox
     }
   }
 
-  return { handle, finish, progress, recover, dispatch, manifest, jobView, store };
+  return { handle, finish, progress, recover };
 }
