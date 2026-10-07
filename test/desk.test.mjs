@@ -118,7 +118,14 @@ test("manifest: the workers (id, agent id, wallet, record link), the rate in USD
     ["w3", null, W[2].address, `https://priors.trade/agent?owner=${W[2].address}`, 0],
   ]);
   assert.equal(m.model.accepting, true);
+  assert.equal(m.version, null);
   assert.deepEqual(await (await call("GET", "/")).json(), m);
+});
+
+test("manifest: a deployment names the commit it runs (AGENT002_VERSION); a value that is not a version is refused", async () => {
+  const { call } = setup({ AGENT002_VERSION: "67ea56f" });
+  assert.equal((await (await call("GET", "/manifest")).json()).version, "67ea56f");
+  assert.throws(() => settingsFromEnv(env({ AGENT002_VERSION: "<script>" })), /AGENT002_VERSION/);
 });
 
 test("USDG: unpaid -> 402 for exactly minutes x rate to the assigned worker; paid -> settled, run, result and receipt", async () => {

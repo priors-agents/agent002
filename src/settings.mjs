@@ -16,6 +16,7 @@
 //   AGENT002_RPC                   Robinhood Chain JSON-RPC (default the public one)
 //   AGENT002_FACILITATOR_URL       the x402 facilitator (default https://facilitator.priors.trade)
 //   AGENT002_PUBLIC_URL            the service's public URL (default: the URL each request came to)
+//   AGENT002_VERSION               the source commit a deployment runs, shown in the manifest (default none)
 //   AGENT002_WORKER_ADDRESS_<n>    worker n's wallet (n = 1, 2, 3); or
 //   AGENT002_WORKER_KEY_<n>        worker n's key, secret (the address is derived from it)
 //   AGENT002_WORKER_AGENT_ID_<n>   worker n's ERC-8004 agent id, once `agent002 join` registered it
@@ -123,6 +124,7 @@ export function settingsFromEnv(env = {}, { workers: baseWorkers = null } = {}) 
     rpc,
     facilitatorUrl: str(env, "AGENT002_FACILITATOR_URL", DEFAULTS.facilitatorUrl),
     publicUrl: str(env, "AGENT002_PUBLIC_URL", null),
+    version: str(env, "AGENT002_VERSION", null),
   };
   s.rateUsdgAtomic = toAtomic(s.rateUsdg, USDG.decimals, "AGENT002_RATE_USDG");
   s.ratePriorsAtomic = toAtomic(s.ratePriors, PRIORS.decimals, "AGENT002_RATE_PRIORS");
@@ -130,6 +132,7 @@ export function settingsFromEnv(env = {}, { workers: baseWorkers = null } = {}) 
   if (s.maxMinutes < s.minMinutes) throw new Error("AGENT002_MAX_MINUTES is below AGENT002_MIN_MINUTES");
   if (s.jobSpendCapUsd > s.dailySpendCapUsd) throw new Error("AGENT002_JOB_SPEND_CAP_USD cannot be above AGENT002_DAILY_SPEND_CAP_USD");
   if (s.publicUrl && !/^https?:\/\//.test(s.publicUrl)) throw new Error("AGENT002_PUBLIC_URL must be an http(s) URL");
+  if (s.version && !/^[0-9A-Za-z._+-]{1,64}$/.test(s.version)) throw new Error("AGENT002_VERSION must be a commit or version name (letters, digits, . _ + -)");
 
   const fromEnv = workersFromEnv(env);
   const byId = new Map((baseWorkers || []).map((w) => [w.id, w]));

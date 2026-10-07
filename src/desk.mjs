@@ -83,6 +83,7 @@ export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox
       name: "agent002",
       description: "A fleet of AI workers that sell their time by the minute on Robinhood Chain. Hire one for N minutes: pay N x the rate in USDG over x402, or in PRIORS by transfer; the payment lands in the wallet of the worker that does the job. Each worker runs an agent loop with read-only Priors tools, under a wall-clock limit of the minutes bought and a model-spend cap.",
       source: SOURCE,
+      version: settings.version,
       url: origin,
       chain: NETWORK,
       sandbox,

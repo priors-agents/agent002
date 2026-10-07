@@ -241,7 +241,7 @@ agent002 wrangler-secrets            # writes .agent002/wrangler-secrets.json (o
 # put the printed AGENT002_WORKER_ADDRESS_<n> / AGENT002_WORKER_AGENT_ID_<n> in wrangler.jsonc "vars", then:
 npx wrangler secret bulk .agent002/wrangler-secrets.json && rm .agent002/wrangler-secrets.json
 npx wrangler secret put OPENROUTER_API_KEY    # if it was not in that file
-npx wrangler deploy
+npx wrangler deploy --var AGENT002_VERSION:$(git rev-parse --short HEAD)   # the manifest's `version` names this commit
 ```
 
 Secrets (never in a file you commit): `OPENROUTER_API_KEY`; `AGENT002_FACILITATOR_KEY_1`, `_2`, `_3` (each worker's
@@ -277,6 +277,7 @@ All from the environment, the same names in Node and in the Worker (`vars` and s
 | `AGENT002_FACILITATOR_URL` | https://facilitator.priors.trade | the x402 facilitator |
 | `AGENT002_OPENROUTER_URL` | https://openrouter.ai/api/v1 | the model endpoint (OpenRouter's API, or one compatible with it) |
 | `AGENT002_PUBLIC_URL` | each request's own URL | the service's public URL, for the 402's resource and the manifest |
+| `AGENT002_VERSION` | none | the source commit a deployment runs, given as the manifest's `version` |
 | `AGENT002_WORKER_ADDRESS_<n>` or `AGENT002_WORKER_KEY_<n>` | `.agent002/workers.json` | worker n's wallet (n = 1, 2, 3) |
 | `AGENT002_WORKER_AGENT_ID_<n>` | from `agent002 join` | worker n's ERC-8004 id |
 | `AGENT002_FACILITATOR_KEY_<n>` | `.agent002/merchant.json` | secret: worker n's facilitator API key |
