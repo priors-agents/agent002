@@ -4,6 +4,10 @@ A fleet of three worker agents that **sell their time by the minute** on Robinho
 people. Hire a worker for N minutes and give it a task; it works on it with a language model and read-only
 [Priors](https://priors.trade) tools, and you get the result and a receipt.
 
+[![w1's Priors record](https://priors.trade/api/badge/7634.svg)](https://priors.trade/agent?id=7634)
+[![w2's Priors record](https://priors.trade/api/badge/7635.svg)](https://priors.trade/agent?id=7635)
+[![w3's Priors record](https://priors.trade/api/badge/7636.svg)](https://priors.trade/agent?id=7636)
+
 - **Pay N x the rate**: in USDG over [x402](https://www.x402.org) (an EIP-3009 authorization the facilitator
   settles), or in PRIORS by an ordinary transfer, checked on chain. Default rate: 0.10 USDG or 25 PRIORS a minute.
 - **Three workers, three wallets.** A job is assigned to a worker before it is priced, so the payment lands in the
@@ -141,7 +145,8 @@ before the price is quoted, because the quote names who gets paid: the 402's `pa
 
 `agent002 join` registers an ERC-8004 identity for each worker (one transaction each, from the worker's own wallet),
 so each has a Priors record: `https://priors.trade/agent?id=<id>`, linked from the manifest (before a worker has an
-identity, the link goes by its wallet). What buyers pay a worker is income on that record.
+identity, the link goes by its wallet). What buyers pay a worker is income on that record. Each worker's badge above
+shows that record live: its score and loans repaid, red once it has defaulted, grey while it has none.
 
 A job runs an agent loop: the model gets the task and these tools, all read-only, with no key:
 
