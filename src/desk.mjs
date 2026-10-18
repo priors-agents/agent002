@@ -6,6 +6,9 @@
 //   POST /jobs                 {minutes, task}: unpaid -> 402 for minutes x rate USDG to the assigned worker (x402);
 //                              paid (PAYMENT-SIGNATURE) -> settled, queued, 201 with the job id
 //   POST /jobs                 {minutes, task, quote, payment: {token: "PRIORS", txHash}}: checked on chain, then queued
+//   GET  /recipes              the fixed-price recipes (src/recipes.mjs); GET /recipes/:key one of them
+//   POST /recipes/:key         the recipe's input: checked (a bad one is a 400, never a 402); unpaid -> 402 for the
+//                              recipe's price in USDG to the assigned worker (x402); paid -> settled, queued, 201
 //   GET  /jobs/:id             status, result, and the receipt (payer, amount, token, tx, worker, times, model spend)
 //
 // A job is assigned before it is priced (src/fleet.mjs), so the payment lands in the wallet of the worker that does
@@ -20,6 +23,7 @@ import { checkCanTakeJob, reserve, settleJob, availableUsd, DailyCapReached, nex
 import { PaymentRefused, judgePriorsTransfer, readPriorsTransfer } from "./priors-pay.mjs";
 import { requirementFor, paymentRequired, encodeRequired, encodeSettlement, readPayment, quoteIdOf, sameRequirement, authorizationNonce } from "./x402.mjs";
 import { MCP_READ_TOOLS } from "./tools.mjs";
+import { RECIPES, recipeByKey, recipeView, checkInput } from "./recipes.mjs";
 import { mutex } from "./store.mjs";
 import { redact, safeMessage } from "./secrets.mjs";
 
@@ -81,7 +85,7 @@ export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox
     const t = now();
     return {
       name: "agent002",
-      description: "A fleet of AI workers that sell their time by the minute on Robinhood Chain. Hire one for N minutes: pay N x the rate in USDG over x402, or in PRIORS by transfer; the payment lands in the wallet of the worker that does the job. Each worker runs an agent loop with read-only Priors tools, under a wall-clock limit of the minutes bought and a model-spend cap.",
+      description: "A fleet of AI workers that sell their time by the minute on Robinhood Chain. Hire one for N minutes: pay N x the rate in USDG over x402, or in PRIORS by transfer; or buy a recipe run (`recipes`): a fixed price in USDG over x402 for a finished result. The payment lands in the wallet of the worker that does the job. Each worker runs an agent loop with read-only Priors tools, under a wall-clock limit and a model-spend cap.",
       source: SOURCE,
       version: settings.version,
       url: origin,
@@ -98,7 +102,7 @@ export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox
           available: workers.some((w) => !!facilitatorFor(w)),
           transfer: "EIP-3009 transferWithAuthorization, signed by the buyer and settled by the facilitator",
           payer: "an EOA: the facilitator settles only EIP-3009 signatures from a plain key (no smart-contract wallets)",
-          how: "POST /jobs {minutes, task} -> 402 whose PAYMENT-REQUIRED asks minutes x rate USDG to the assigned worker's wallet -> send the same request with PAYMENT-SIGNATURE",
+          how: "POST /jobs {minutes, task} -> 402 whose PAYMENT-REQUIRED asks minutes x rate USDG to the assigned worker's wallet -> send the same request with PAYMENT-SIGNATURE. A recipe: POST /recipes/{key} with its input -> 402 for the recipe's price -> the same request with PAYMENT-SIGNATURE",
         },
         {
           token: "PRIORS", asset: PRIORS.address, decimals: PRIORS.decimals, method: "transfer",
@@ -113,9 +117,12 @@ export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox
       }),
       model: { name: settings.model, jobSpendCapUsd: caps.jobCapUsd, dailySpendCapUsd: caps.dailyCapUsd, dailyLeftUsd: left, accepting: left + 1e-9 >= caps.jobCapUsd, ...(left + 1e-9 >= caps.jobCapUsd ? {} : { reopensAt: nextUtcDay(t) }) },
       tools: ["priors_check", ...MCP_READ_TOOLS, "time_left"],
-      endpoints: { manifest: "GET /manifest", quote: "POST /quote", hire: "POST /jobs", job: "GET /jobs/{id}" },
+      recipes: recipeList(),
+      endpoints: { manifest: "GET /manifest", quote: "POST /quote", hire: "POST /jobs", recipes: "GET /recipes", recipe: "POST /recipes/{key}", job: "GET /jobs/{id}" },
     };
   }
+
+  const recipeList = () => RECIPES.map((r) => recipeView(r, { jobSpendCapUsd: caps.jobCapUsd }));
 
   // ---- quotes ----------------------------------------------------------------------------------------------------
 
@@ -184,31 +191,58 @@ export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox
     const minutes = checkMinutes(body.minutes, settings);
     const task = checkTask(body.task);
     if (body.payment !== undefined) return priorsJob(body, minutes, task);
-    const payment = readPayment(request);
-    const taskHash = await sha256Hex(task);
-    const resource = `${settings.publicUrl ? settings.publicUrl.replace(/\/+$/, "") : url.origin}/jobs`;
-    if (!payment) return usdgQuote({ minutes, taskHash, resource });
-    return usdgPaid({ payment, minutes, task, taskHash });
+    const order = { minutes, task, taskHash: await sha256Hex(task), amount: priceFor(minutes, settings.rateUsdgAtomic), recipe: null };
+    return usdgOrder(request, url, "/jobs", order, (w, amount) => `${minutes} minute(s) of agent002 worker ${w.id}'s time: ${amount} USDG to ${w.address}`);
   }
 
-  /** Unpaid: assign a worker and answer 402 with the requirement for minutes x rate USDG to its wallet. */
-  async function usdgQuote({ minutes, taskHash, resource }) {
-    const amount = priceFor(minutes, settings.rateUsdgAtomic);
+  // ---- POST /recipes/:key -----------------------------------------------------------------------------------------
+
+  /** A recipe run: its input is checked before anything is quoted, then it is paid in USDG like a job by the minute. */
+  async function postRecipe(request, url, key) {
+    const body = await readBody(request); // read first: a refusal is never sent with the request's body still unread
+    const recipe = recipeByKey(key);
+    if (!recipe) throw Object.assign(new Error(`no recipe named ${JSON.stringify(key.slice(0, 40))}: see GET /recipes`), { status: 404, code: "unknown_recipe" });
+    if (body.payment !== undefined) throw new BadRequest("a recipe is paid in USDG over x402: send its input without payment for a 402", "bad_payment");
+    const input = checkInput(recipe, body); // a bad input is a 400 here: no quote, no 402
+    const task = recipe.task(input);
+    const order = {
+      minutes: recipe.minutes, task, taskHash: await sha256Hex(`recipe ${recipe.key}\n${task}`), amount: recipe.priceAtomic,
+      recipe: recipe.key, input, spendCapUsd: Math.min(recipe.spendCapUsd, caps.jobCapUsd),
+    };
+    return usdgOrder(request, url, `/recipes/${recipe.key}`, order, (w, amount) => `one run of agent002's recipe "${recipe.title}" (a fixed price) by worker ${w.id}: ${amount} USDG to ${w.address}`);
+  }
+
+  /**
+   * A job paid in USDG over x402: unpaid, its 402; paid, its settlement. `order`: { minutes, task, taskHash, amount,
+   * recipe (a key, or null for a job by the minute), input, spendCapUsd }.
+   */
+  async function usdgOrder(request, url, path, order, describe) {
+    const payment = readPayment(request);
+    if (payment) return usdgPaid(payment, order);
+    const resource = `${settings.publicUrl ? settings.publicUrl.replace(/\/+$/, "") : url.origin}${path}`;
+    return usdgQuote(order, resource, describe);
+  }
+
+  /** Unpaid: assign a worker and answer 402 with the requirement for the order's amount of USDG to its wallet. */
+  async function usdgQuote(order, resource, describe) {
+    const { minutes, taskHash, recipe } = order;
+    const amount = formatAtomic(order.amount, USDG.decimals);
     await prune();
-    const { quote, worker } = await newQuote((t) => ({ method: "x402", token: "USDG", minutes, amount: amount.toString(), taskHash, expiresAt: t + settings.x402QuoteSeconds * 1000 }), (w) => !!facilitatorFor(w));
+    const { quote, worker } = await newQuote((t) => ({ method: "x402", token: "USDG", minutes, amount: order.amount.toString(), taskHash, ...(recipe ? { recipe } : {}), expiresAt: t + settings.x402QuoteSeconds * 1000 }), (w) => !!facilitatorFor(w));
     const requirement = requirementFor(quote, { maxTimeoutSeconds: settings.x402QuoteSeconds });
     const pr = paymentRequired({
       requirement,
       url: resource,
-      description: `${minutes} minute(s) of agent002 worker ${worker.id}'s time: ${formatAtomic(amount, USDG.decimals)} USDG to ${worker.address}`,
+      description: describe(worker, amount),
       error: "PAYMENT-SIGNATURE header is required",
     });
-    log?.info?.(`quote ${quote.id}: 402 for ${minutes} min, ${formatAtomic(amount, USDG.decimals)} USDG to ${worker.id}`);
-    return json(402, { ...pr, quote: { id: quote.id, worker: publicWorker(worker), minutes, amount: formatAtomic(amount, USDG.decimals), token: "USDG", expiresAt: new Date(quote.expiresAt).toISOString() } }, { "payment-required": encodeRequired(pr) });
+    log?.info?.(`quote ${quote.id}: 402 for ${recipe ? `recipe ${recipe}` : `${minutes} min`}, ${amount} USDG to ${worker.id}`);
+    return json(402, { ...pr, quote: { id: quote.id, worker: publicWorker(worker), ...(recipe ? { recipe } : {}), minutes, amount, token: "USDG", expiresAt: new Date(quote.expiresAt).toISOString() } }, { "payment-required": encodeRequired(pr) });
   }
 
   /** Paid: check the payment against the quote it names, reserve the job's model budget, verify, settle, queue. */
-  async function usdgPaid({ payment, minutes, task, taskHash }) {
+  async function usdgPaid(payment, order) {
+    const { minutes, task, taskHash } = order;
     const qid = quoteIdOf(payment);
     if (!qid) throw new PaymentRefused("no_quote", "the payment names no quote: send the request without payment for a 402, and pay what it asks");
     const nonce = authorizationNonce(payment);
@@ -221,7 +255,7 @@ export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox
       }
       if (quote.status === "settling") throw new PaymentRefused("settling", "this payment is being settled: send the same request again in a few seconds", { status: 409, retry: true });
       if (quote.status === "unsettled" && quote.nonce !== nonce) throw new PaymentRefused("unsettled", "this quote has a payment whose settlement is unconfirmed: send that same payment again to reconcile it", { status: 409 });
-      if (quote.minutes !== minutes || quote.taskHash !== taskHash) throw new BadRequest("this payment's quote was for another job (other minutes or task): send this job unpaid for its own 402", "quote_mismatch");
+      if (quote.minutes !== minutes || quote.taskHash !== taskHash || (quote.recipe ?? null) !== order.recipe) throw new BadRequest("this payment's quote was for another job (other minutes, task, recipe or input): send this job unpaid for its own 402", "quote_mismatch");
       const requirement = requirementFor(quote, { maxTimeoutSeconds: settings.x402QuoteSeconds });
       if (!sameRequirement(payment.accepted, requirement)) throw new PaymentRefused("requirement_mismatch", "the payment does not accept the requirement this quote issued (amount, asset, network or payTo differ)");
       if (quote.status === "open" && quote.expiresAt < now()) throw new PaymentRefused("quote_expired", "this quote expired: send the request without payment for a fresh 402");
@@ -278,7 +312,9 @@ export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox
     const job = await lock(async () => {
       const t = now();
       const j = {
-        id: jobId, status: "queued", workerId: worker.id, minutes, task, quoteId: quote.id, createdAt: t, modelSpendUsd: 0,
+        id: jobId, status: "queued", workerId: worker.id, minutes, task,
+        ...(order.recipe ? { recipe: order.recipe, input: order.input, spendCapUsd: order.spendCapUsd } : {}),
+        quoteId: quote.id, createdAt: t, modelSpendUsd: 0,
         payment: { method: "x402", token: "USDG", tokenAddress: USDG.address, amount: quote.amount, payer: settlement.payer || payer, txHash: settlement.transaction || null, network: settlement.network || NETWORK, paidAt: t, ...(settlement.reconciled ? { note: "reconciled from the chain: the settlement's transaction hash was not reported" } : {}) },
       };
       Object.assign(quote, { status: "used" });
@@ -487,6 +523,7 @@ export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox
     return {
       id: j.id,
       status: j.status,
+      ...(j.recipe ? { recipe: { key: j.recipe, title: recipeByKey(j.recipe)?.title ?? j.recipe }, input: j.input ?? null } : {}),
       minutes: j.minutes,
       task: j.task,
       worker: publicWorker(w),
@@ -508,10 +545,12 @@ export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox
         paidAt: new Date(j.payment.paidAt).toISOString(),
         startedAt: j.startedAt ?? null,
         finishedAt: j.finishedAt ?? null,
-        minutesBought: j.minutes,
+        minutesBought: j.recipe ? null : j.minutes, // a recipe is bought at a fixed price, not by the minute
+        timeLimitMinutes: j.minutes,
         minutesUsed: started !== null && finished !== null ? Math.round(((finished - started) / 60_000) * 100) / 100 : null,
         secondsUsed: started !== null && finished !== null ? Math.round((finished - started) / 100) / 10 : null,
         modelSpendUsd: j.modelSpendUsd ?? 0,
+        ...(j.recipe ? { modelSpendCapUsd: j.spendCapUsd } : {}),
         model: j.model ?? settings.model,
         steps: j.steps ?? null,
         toolCalls: j.toolCalls ?? null,
@@ -550,6 +589,13 @@ export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox
       if (request.method === "GET" && (path === "/" || path === "/manifest")) return json(200, await manifest(settings.publicUrl || url.origin));
       if (path === "/quote" && (request.method === "POST" || request.method === "GET")) return await priorsQuote(request, url);
       if (path === "/jobs" && request.method === "POST") return await postJob(request, url);
+      if (path === "/recipes" && request.method === "GET") return json(200, { recipes: recipeList() });
+      const r = /^\/recipes\/([^/]+)$/.exec(path);
+      if (r && request.method === "POST") return await postRecipe(request, url, r[1]);
+      if (r && request.method === "GET") {
+        const one = recipeList().find((x) => x.key === r[1]);
+        return one ? json(200, one) : json(404, { error: "no such recipe: see GET /recipes", code: "unknown_recipe" });
+      }
       const m = /^\/jobs\/([^/]+)$/.exec(path);
       if (m && request.method === "GET") return await getJob(m[1]);
       return json(404, { error: "not found: see GET /manifest", code: "not_found" });

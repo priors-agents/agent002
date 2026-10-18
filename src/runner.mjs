@@ -5,6 +5,7 @@ import { runJob } from "./agent.mjs";
 import { makeModel } from "./model.mjs";
 import { priorsToolbox } from "./tools.mjs";
 import { safeMessage } from "./secrets.mjs";
+import { jobSpendCap } from "./budget.mjs";
 
 export function localRunner({ settings, log = null, toolbox = () => priorsToolbox(), modelFor = () => makeModel(settings) }) {
   return {
@@ -15,7 +16,7 @@ export function localRunner({ settings, log = null, toolbox = () => priorsToolbo
         try {
           const model = await modelFor();
           outcome = await runJob({
-            job, worker, model, toolbox: toolbox(), spendCapUsd: settings.jobSpendCapUsd, deadline: job.deadline,
+            job, worker, model, toolbox: toolbox(), spendCapUsd: jobSpendCap(job, settings.jobSpendCapUsd), deadline: job.deadline,
             spentUsd: job.modelSpendUsd || 0, onSpend: (s) => { void progress(job.id, s); }, log,
           });
         } catch (e) {

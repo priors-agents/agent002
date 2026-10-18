@@ -55,6 +55,9 @@ export function reserve(ledger, jobId, { dailyCapUsd, jobCapUsd }, now) {
   return l;
 }
 
+/** The model cap a job runs under: the per-job cap, or the job's own when it is lower (a recipe's: half its price). */
+export const jobSpendCap = (job, jobCapUsd) => (Number(job?.spendCapUsd) > 0 ? Math.min(Number(job.spendCapUsd), jobCapUsd) : jobCapUsd);
+
 /** The job finished having spent `spentUsd`: its reservation is released and its spend counted. */
 export function settleJob(ledger, jobId, spentUsd, now) {
   const l = rollLedger(ledger, now);

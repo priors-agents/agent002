@@ -20,6 +20,7 @@ import { runJob } from "./agent.mjs";
 import { makeModel } from "./model.mjs";
 import { priorsToolbox } from "./tools.mjs";
 import { redact, safeMessage } from "./secrets.mjs";
+import { jobSpendCap } from "./budget.mjs";
 
 /** A JobRunner's alarm has 15 minutes of wall time: a job can be at most 14 minutes long here. */
 const MAX_MINUTES_IN_A_WORKER = 14;
@@ -101,7 +102,7 @@ export class JobRunner extends DurableObject {
         const worker = settings.workers.find((w) => w.id === job.workerId);
         if (!worker) throw new Error(`worker ${job.workerId} is no longer configured`);
         outcome = await runJob({
-          job, worker, model: await makeModel(settings), toolbox: priorsToolbox(), spendCapUsd: settings.jobSpendCapUsd,
+          job, worker, model: await makeModel(settings), toolbox: priorsToolbox(), spendCapUsd: jobSpendCap(job, settings.jobSpendCapUsd),
           deadline: job.deadline, spentUsd: spent, log,
           onSpend: (s) => { void this.ctx.storage.put("spent", s); }, // a retried alarm resumes with what was spent
         });

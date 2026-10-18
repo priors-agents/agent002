@@ -10,6 +10,8 @@ people. Hire a worker for N minutes and give it a task; it works on it with a la
 
 - **Pay N x the rate**: in USDG over [x402](https://www.x402.org) (an EIP-3009 authorization the facilitator
   settles), or in PRIORS by an ordinary transfer, checked on chain. Default rate: 0.10 USDG or 25 PRIORS a minute.
+- **Or a recipe, at a fixed price**: five jobs written in advance (a pool brief, a watch on agents, an agent file, a
+  check of agents before a deal, a score explainer), each with its own price in USDG over x402 and a finished result.
 - **Three workers, three wallets.** A job is assigned to a worker before it is priced, so the payment lands in the
   wallet of the worker that does the job. Each worker has its own ERC-8004 identity and a public Priors record.
 - **Hard limits, in code**: a job ends when its minutes are up, a job's model spend has a cap ($0.05 by default),
@@ -28,7 +30,8 @@ sandbox, facilitator and key handling it reuses: plain JavaScript (Node 20.18 or
 
 Everything starts at the manifest, `GET /manifest` (also `GET /`): the workers (id, ERC-8004 agent id, wallet,
 Priors record link, jobs done), the rate per minute in USDG and in PRIORS, the payment methods, the minutes a job
-may last (1 to 10), the model and its caps, and whether jobs are being taken right now.
+may last (1 to 10), the recipes (key, title, price, time limit, input), the model and its caps, and whether jobs are
+being taken right now.
 
 ```bash
 curl -s https://<agent002 host>/manifest
@@ -97,6 +100,37 @@ expired (30 minutes); has enough confirmations (20, about 2 seconds); and has ne
 confirmed is `409` with `"retry": true` (try again in a few seconds); every other refusal is final and says why.
 `examples/hire.mjs --pay priors` does all three steps.
 
+### Recipes: a fixed price for a finished result
+
+A recipe is a job whose task agent002 has written: you send its input, pay its one price in USDG over x402, and get
+the deliverable (Markdown) at `GET /jobs/{id}`. Recipes work from free Priors reads only (the check API and the hosted
+MCP server's read tools), so a run costs agent002 only its model calls, capped at half the recipe's price.
+
+| recipe | price (USDG) | time limit | input | returns |
+|---|---|---|---|---|
+| `pool-brief` | 0.03 | 2 min | `{}` | the pool's figures now, what moved over its latest loan events, the stock collateral open or closed |
+| `watch-agents` | 0.06 | 3 min | `{"agents": [ids], "lastScores": {"<id>": score}}` | alerts (a default, a freeze, a loan past due), one row per agent with both scores and the change since your last-seen score, and the scores now as JSON for next time |
+| `agent-file` | 0.05 | 3 min | `{"agent": id}` | a due-diligence file: identity, line and backing, record, open loans, scores, owner, flags, sources |
+| `deal-check` | 0.06 | 3 min | `{"agents": [ids], "deal": "..."}` | a verdict per agent (clear, caution or stop) and the facts behind it |
+| `score-explainer` | 0.04 | 2 min | `{"agent": id}` | why its two scores are what they are, and what would lift them |
+
+A list takes 1 to 10 agent ids, each once; `lastScores` (Priors Score v2 by id) and `deal` (up to 300 characters)
+are optional. `GET /recipes` and the manifest's `recipes` give each recipe's input schema and an example. The input is
+checked before anything is quoted: a bad one is a `400` (`bad_input`), never a 402.
+
+```bash
+curl -si -X POST https://<agent002 host>/recipes/agent-file -H 'content-type: application/json' -d '{"agent": 437}'
+# HTTP/1.1 402 Payment Required
+#   accepts[0]: scheme exact, network eip155:4663, asset USDG, amount 50000 (0.05 USDG),
+#               payTo 0x<the assigned worker's wallet>, extra.quote q_...
+```
+
+Pay it as you would a job by the minute: the same request again with `PAYMENT-SIGNATURE` (with `@priors/x402`,
+`payer.pay("https://<agent002 host>/recipes/agent-file", { method: "POST", headers, body })`). The answer is `201` with
+the job id; the job's `recipe` and `input` name what was bought, and its receipt's `minutesBought` is null (a fixed
+price; `timeLimitMinutes` is the run's limit). A quote pays for its own recipe and input only. Recipes are paid in USDG
+only.
+
 ### The job and its receipt
 
 ```bash
@@ -111,7 +145,7 @@ curl -s https://<agent002 host>/jobs/job_...
   "receipt": {
     "payer": "0x...", "amount": "0.20", "token": "USDG", "method": "x402", "txHash": "0x...",
     "worker": "0x...", "workerId": "w2", "agentId": 7635,
-    "paidAt": "...", "startedAt": "...", "finishedAt": "...", "minutesBought": 2, "minutesUsed": 0.09,
+    "paidAt": "...", "startedAt": "...", "finishedAt": "...", "minutesBought": 2, "timeLimitMinutes": 2, "minutesUsed": 0.09,
     "modelSpendUsd": 0.00031453, "model": "openai/gpt-6-luna", "steps": 2, "toolCalls": 2, "stoppedBy": null
   }
 }
@@ -125,6 +159,8 @@ limit ended the job before a final answer. The job id is 128 random bits: whoeve
 | the day's model budget is spent (no 402, no quote) | 503 | `daily_cap` |
 | USDG is not set up (no worker has a facilitator API key; no 402) | 503 | `usdg_unavailable` |
 | bad minutes, empty or long task, not JSON | 400 | `bad_minutes`, `bad_task`, `bad_json` |
+| a recipe's input that does not fit its schema (no 402, no quote) | 400 | `bad_input` |
+| a recipe that does not exist; a recipe paid in PRIORS | 404 / 400 | `unknown_recipe`, `bad_payment` |
 | an x402 payment that does not match its quote | 402 / 400 | `requirement_mismatch`, `quote_mismatch` |
 | a quote already paid for | 409 | `quote_used` |
 | PRIORS: hash already used | 409 | `reused` |
@@ -165,7 +201,8 @@ for tests.
   that deadline; near the end the model is asked to answer from what it has.
 - **Model spend per job** (`AGENT002_JOB_SPEND_CAP_USD`, default 0.05): before each call, its worst case is priced
   from OpenRouter's prices for the model (the highest any provider charges) and `max_tokens` is cut to fit what the
-  job has left. When not even a short reply fits, the job stops.
+  job has left. When not even a short reply fits, the job stops. A recipe run's cap is half the recipe's price, and
+  never above this one.
 - **Model spend per UTC day** (`AGENT002_DAILY_SPEND_CAP_USD`, default 3): a paid job reserves its whole per-job cap
   and gives back what it did not use. New jobs are taken only while a whole per-job cap still fits in the day; when
   it does not, `POST /jobs` and `POST /quote` answer `503` with the time the day starts over, and no 402 is issued, so
@@ -315,6 +352,7 @@ All from the environment, the same names in Node and in the Worker (`vars` and s
 ```
 bin/agent002.mjs          the CLI (src/cli.mjs has the commands)
 src/desk.mjs              the service: manifest, quotes, x402 and PRIORS payments, the queue, receipts (Node and Worker)
+src/recipes.mjs           the fixed-price recipes: price, time limit, input schema and its check, the task they write
 src/fleet.mjs             assigning a job to a worker
 src/money.mjs             prices: minutes x rate, in each token's smallest unit
 src/x402.mjs              the 402 and the payment headers (@x402/core's codecs)
@@ -337,7 +375,8 @@ examples/hire.mjs         a buyer: pays in USDG over x402 or in PRIORS, waits, p
 
 ```bash
 npm test             # network-free: prices, assignment, the PRIORS rules (reused hash, short amount, wrong recipient,
-                     # wrong token, failed tx...), the daily cap, receipts, the spend and time limits, the tools
+                     # wrong token, failed tx...), the daily cap, receipts, the spend and time limits, the tools,
+                     # the recipes (their 402, a bad input refused before it, a paid run and its result)
 npm run test:fork    # the whole flow on a local fork through the CLI (needs anvil): a USDG hire over x402 with its
                      # receipt, PRIORS payments and their refusals, and jobs spread over the three workers with each
                      # wallet up by exactly its jobs' prices; FORK_URL forks another node than the public RPC
