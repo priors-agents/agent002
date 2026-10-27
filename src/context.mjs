@@ -36,7 +36,8 @@ export async function makeContext({ env = process.env, quiet = false } = {}) {
   const ids = (sandbox ? sb?.agentIds : fleet.agentIds) || {};
   const fileWorkers = loadWorkerFile(home).map((w) => ({ ...w, agentId: ids[w.id] ?? null }));
   const settings = settingsFromEnv({ ...env, AGENT002_RPC: rpc }, { workers: fileWorkers });
-  if (sandbox) for (const w of settings.workers) w.agentId = ids[w.id] ?? null; // the fork's ids, never mainnet's
+  // the fork's ids, never mainnet's (a hire-only worker keeps the id its variable names: it is no worker of this folder)
+  if (sandbox) for (const w of settings.workers) if (!w.hireOnly) w.agentId = ids[w.id] ?? null;
   const provider = makeProvider(rpc);
   return {
     home, log, settings, sandbox, rpc, provider, sandboxFile: sandbox ? sb : null,

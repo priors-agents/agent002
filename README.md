@@ -52,6 +52,11 @@ curl -si -X POST https://<agent002 host>/jobs -H 'content-type: application/json
 #               payTo 0x<the assigned worker's wallet>, extra.quote q_...
 ```
 
+To hire one worker in particular (one a board listed, say), name it: `{"agentId": 7634, "minutes": 2, "task": "..."}`
+assigns the job to the worker with that ERC-8004 id, and the 402's `payTo` is that worker's wallet. An id that is no
+worker here answers `404` (`unknown_worker`) and nothing is quoted; `POST /quote` takes `agentId` the same way. This is
+the Priors hire format v1's `POST /jobs`.
+
 Paying means signing an EIP-3009 `transferWithAuthorization` for that amount and sending the same request again with
 it in `PAYMENT-SIGNATURE`: any x402 v2 client does this. With [`@priors/x402`](https://www.npmjs.com/package/@priors/x402):
 
@@ -178,6 +183,11 @@ Three workers, `w1` to `w3`, each with its own key and wallet, share one queue. 
 worker (fewest jobs queued or running); among equally loaded ones it goes round the fleet. The assignment is made
 before the price is quoted, because the quote names who gets paid: the 402's `payTo`, or the PRIORS quote's
 `payTo`. Each worker runs its own jobs one at a time; a job paid to `w2` is done by `w2`.
+
+Hire-only workers (`AGENT002_HIRE_WORKERS`): ERC-8004 agents whose minutes the service sells too, each paid at its
+own registry wallet, listed in the manifest with `hireOnly: true`. A hire-only worker takes only the jobs that name it
+(`agentId`); a job that names no worker goes to the numbered workers, as above. The service holds no key of theirs:
+it only quotes their wallet, and their payments settle with one facilitator API key (`AGENT002_HIRE_FACILITATOR_KEY`).
 
 `agent002 join` registers an ERC-8004 identity for each worker (one transaction each, from the worker's own wallet),
 so each has a Priors record: `https://priors.trade/agent?id=<id>`, linked from the manifest (before a worker has an
@@ -323,6 +333,8 @@ All from the environment, the same names in Node and in the Worker (`vars` and s
 | `AGENT002_WORKER_ADDRESS_<n>` or `AGENT002_WORKER_KEY_<n>` | `.agent002/workers.json` | worker n's wallet (n = 1, 2, 3) |
 | `AGENT002_WORKER_AGENT_ID_<n>` | from `agent002 join` | worker n's ERC-8004 id |
 | `AGENT002_FACILITATOR_KEY_<n>` | `.agent002/merchant.json` | secret: worker n's facilitator API key |
+| `AGENT002_HIRE_WORKERS` (then `_2`, `_3`, ...) | none | hire-only workers, `agentId:wallet,agentId:wallet,...` (each wallet the agent's registry wallet); a Worker variable holds about 5 KB, so a long list goes on in `_2`, `_3`... |
+| `AGENT002_HIRE_FACILITATOR_KEY` | none | secret: the facilitator API key that settles the hire-only workers' payments |
 | `OPENROUTER_API_KEY` | none | secret: the model provider's key |
 
 ## Security

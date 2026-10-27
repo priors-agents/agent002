@@ -21,6 +21,11 @@
 //   AGENT002_WORKER_KEY_<n>        worker n's key, secret (the address is derived from it)
 //   AGENT002_WORKER_AGENT_ID_<n>   worker n's ERC-8004 agent id, once `agent002 join` registered it
 //   AGENT002_FACILITATOR_KEY_<n>   secret: worker n's API key with the Priors facilitator (`agent002 merchant register`)
+//   AGENT002_HIRE_WORKERS          hire-only workers: "agentId:wallet,agentId:wallet,..." (each wallet the agent's ERC-8004
+//                                  registry wallet, where its jobs are paid). Continued in AGENT002_HIRE_WORKERS_2, _3...
+//                                  (a hosting platform's variable holds a few KB). A hire-only worker takes only the jobs
+//                                  that name it (POST /jobs {agentId, ...}); jobs that name none go to the workers above
+//   AGENT002_HIRE_FACILITATOR_KEY  secret: the Priors facilitator API key that settles for the hire-only workers
 //   OPENROUTER_API_KEY             secret: the model provider's key
 import { computeAddress, getAddress } from "ethers";
 import { PUBLIC_RPC, USDG, PRIORS, isAddress } from "./chain.mjs";
@@ -30,6 +35,8 @@ import { addSecret } from "./secrets.mjs";
 
 export const FACILITATOR = "https://facilitator.priors.trade";
 export const MAX_WORKERS = 9;
+/** AGENT002_HIRE_WORKERS, then AGENT002_HIRE_WORKERS_2 up to this: how many variables the hire-only list may span. */
+export const MAX_HIRE_VARS = 20;
 
 export const DEFAULTS = Object.freeze({
   rateUsdg: "0.10",
@@ -81,6 +88,25 @@ export function workersFromEnv(env) {
     const id = str(env, `AGENT002_WORKER_AGENT_ID_${n}`, null);
     if (id !== null && !/^\d{1,12}$/.test(id)) throw new Error(`AGENT002_WORKER_AGENT_ID_${n} must be an agent id (digits)`);
     out.push({ id: `w${n}`, n, address: getAddress(address), agentId: id === null ? null : Number(id), ...(key ? { key: key.startsWith("0x") ? key : `0x${key}` } : {}) });
+  }
+  return out;
+}
+
+/**
+ * The hire-only workers: AGENT002_HIRE_WORKERS, then _2, _3... ("agentId:wallet" items, comma-separated), each
+ * { id: "a<agentId>", n: null, agentId, address, hireOnly: true }. Ids and wallets are public; nothing here is secret.
+ */
+export function hireWorkersFromEnv(env) {
+  const out = [];
+  for (let k = 1; k <= MAX_HIRE_VARS; k++) {
+    const name = k === 1 ? "AGENT002_HIRE_WORKERS" : `AGENT002_HIRE_WORKERS_${k}`;
+    const raw = str(env, name, null);
+    if (raw === null) continue;
+    for (const item of raw.split(",").map((x) => x.trim()).filter(Boolean)) {
+      const m = /^(\d{1,12}):(0x[0-9a-fA-F]{40})$/.exec(item);
+      if (!m) throw new Error(`${name}: ${JSON.stringify(item.slice(0, 60))} is not agentId:wallet`);
+      out.push({ id: `a${Number(m[1])}`, n: null, agentId: Number(m[1]), address: getAddress(m[2]), hireOnly: true });
+    }
   }
   return out;
 }
@@ -137,13 +163,20 @@ export function settingsFromEnv(env = {}, { workers: baseWorkers = null } = {}) 
   const fromEnv = workersFromEnv(env);
   const byId = new Map((baseWorkers || []).map((w) => [w.id, w]));
   for (const w of fromEnv) byId.set(w.id, { ...byId.get(w.id), ...w });
-  s.workers = [...byId.values()].sort((a, b) => a.id.localeCompare(b.id, "en", { numeric: true }));
-  const seen = new Set();
+  // the numbered workers first (w1, w2, ...), then the hire-only ones in the order the variables list them
+  s.workers = [...[...byId.values()].sort((a, b) => a.id.localeCompare(b.id, "en", { numeric: true })), ...hireWorkersFromEnv(env)];
+  const seen = new Set(), ids = new Set();
   for (const w of s.workers) {
     const a = w.address.toLowerCase();
     if (seen.has(a)) throw new Error(`two workers share the wallet ${w.address}: each worker needs its own`);
     seen.add(a);
+    if (w.agentId != null) {
+      if (ids.has(w.agentId)) throw new Error(`two workers share the agent id ${w.agentId}: each worker is one ERC-8004 identity`);
+      ids.add(w.agentId);
+    }
   }
   s.facilitatorKeys = facilitatorKeysFromEnv(env);
+  s.hireFacilitatorKey = str(env, "AGENT002_HIRE_FACILITATOR_KEY", null);
+  if (s.hireFacilitatorKey) addSecret(s.hireFacilitatorKey);
   return s;
 }

@@ -154,14 +154,16 @@ export const commands = {
       const merchant = readJson(pathOf(ctx.home, "merchant.json"), {}) || {};
       const clients = new Map();
       const missing = [];
+      const hire = settings.hireFacilitatorKey ? priorsFacilitatorClient({ url: settings.facilitatorUrl, apiKey: settings.hireFacilitatorKey }) : null;
       for (const w of settings.workers) {
+        if (w.hireOnly) { if (hire) clients.set(w.id, hire); else missing.push(w); continue; }
         const m = merchant.workers?.[w.id];
         const apiKey = settings.facilitatorKeys[w.id] || (m && m.payTo?.toLowerCase() === w.address.toLowerCase() ? m.apiKey : null);
         if (!apiKey) { missing.push(w); continue; }
         addSecret(apiKey);
         clients.set(w.id, priorsFacilitatorClient({ url: settings.facilitatorUrl, apiKey }));
       }
-      if (missing.length) { ctx.close(); throw Object.assign(new Error(`no facilitator API key for ${missing.map((w) => w.id).join(", ")}: run \`agent002 merchant register --url https://<public URL>\` (or set AGENT002_FACILITATOR_KEY_<n>)`), { exitCode: 3 }); }
+      if (missing.length) { ctx.close(); throw Object.assign(new Error(`no facilitator API key for ${missing.slice(0, 5).map((w) => w.id).join(", ")}${missing.length > 5 ? ` and ${missing.length - 5} more` : ""}: run \`agent002 merchant register --url https://<public URL>\` (or set AGENT002_FACILITATOR_KEY_<n>; AGENT002_HIRE_FACILITATOR_KEY for the hire-only workers)`), { exitCode: 3 }); }
       facilitatorFor = (w) => clients.get(w.id);
       how = `the Priors facilitator (${settings.facilitatorUrl})`;
     }

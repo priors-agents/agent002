@@ -4,15 +4,17 @@
 //   GET  /manifest             (also GET /) who the workers are, the rate per minute in USDG and PRIORS, how to pay
 //   POST /quote                {minutes, payer}: a PRIORS quote, so the buyer knows which worker's wallet to pay
 //   POST /jobs                 {minutes, task}: unpaid -> 402 for minutes x rate USDG to the assigned worker (x402);
-//                              paid (PAYMENT-SIGNATURE) -> settled, queued, 201 with the job id
+//                              paid (PAYMENT-SIGNATURE) -> settled, queued, 201 with the job id. With {agentId}: that
+//                              worker's time (a hirer that chose it on a board, the Priors hire format v1); without it,
+//                              the least-loaded of the workers that are not hire-only
 //   POST /jobs                 {minutes, task, quote, payment: {token: "PRIORS", txHash}}: checked on chain, then queued
 //   GET  /recipes              the fixed-price recipes (src/recipes.mjs); GET /recipes/:key one of them
 //   POST /recipes/:key         the recipe's input: checked (a bad one is a 400, never a 402); unpaid -> 402 for the
 //                              recipe's price in USDG to the assigned worker (x402); paid -> settled, queued, 201
 //   GET  /jobs/:id             status, result, and the receipt (payer, amount, token, tx, worker, times, model spend)
 //
-// A job is assigned before it is priced (src/fleet.mjs), so the payment lands in the wallet of the worker that does
-// it. Paid jobs wait in one queue; each worker runs its own, one at a time, through `runner` (in-process in Node, a
+// A job is assigned before it is priced (src/fleet.mjs), or to the worker it names (agentId), so the payment lands in
+// the wallet of the worker that does it. Paid jobs wait in one queue; each worker runs its own, one at a time, through `runner` (in-process in Node, a
 // JobRunner Durable Object per job in a Worker), which calls finish() with the outcome. Before anything is quoted, the
 // day's model budget must still hold a whole job (src/budget.mjs): when it does not, the request is refused with a
 // 503 and no 402 is ever issued.
@@ -35,8 +37,17 @@ const CORS = {
   "access-control-expose-headers": "payment-required, payment-response",
 };
 
-export function json(status, body, headers = {}) {
-  return new Response(JSON.stringify(body, null, 2), { status, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", ...CORS, ...headers } });
+export function json(status, body, headers = {}, { compact = false } = {}) {
+  return new Response(compact ? JSON.stringify(body) : JSON.stringify(body, null, 2), { status, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", ...CORS, ...headers } });
+}
+
+/** The worker a request names (`agentId`, an ERC-8004 id as a number or digits), or null when it names none. */
+export function agentIdOf(body) {
+  const v = body?.agentId;
+  if (v === undefined || v === null) return null;
+  const n = typeof v === "string" && /^\d{1,12}$/.test(v.trim()) ? Number(v) : v;
+  if (!Number.isSafeInteger(n) || n < 1) throw new BadRequest("agentId must be the ERC-8004 id of one of the workers (GET /manifest), or left out", "bad_agent");
+  return n;
 }
 
 /** 128 random bits, hex: quote and job ids are unguessable, so only whoever holds one can read its job. */
@@ -113,12 +124,14 @@ export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox
       ],
       workers: workers.map((w) => {
         const c = counters(fleet, w.id);
-        return { ...publicWorker(w), record: recordLink({ agentId: w.agentId, wallet: w.address, sandbox }), jobsDone: c.done, jobsActive: c.active, earned: { USDG: formatAtomic(c.earned.USDG, USDG.decimals), PRIORS: formatAtomic(c.earned.PRIORS, PRIORS.decimals) } };
+        // a hire-only worker's entry leaves out its record link (the agent id gives it): a fleet of a few hundred stays
+        // well under the 64 KB a board reads of a manifest
+        return { ...publicWorker(w), ...(w.hireOnly ? { hireOnly: true } : { record: recordLink({ agentId: w.agentId, wallet: w.address, sandbox }) }), jobsDone: c.done, jobsActive: c.active, earned: { USDG: formatAtomic(c.earned.USDG, USDG.decimals), PRIORS: formatAtomic(c.earned.PRIORS, PRIORS.decimals) } };
       }),
       model: { name: settings.model, jobSpendCapUsd: caps.jobCapUsd, dailySpendCapUsd: caps.dailyCapUsd, dailyLeftUsd: left, accepting: left + 1e-9 >= caps.jobCapUsd, ...(left + 1e-9 >= caps.jobCapUsd ? {} : { reopensAt: nextUtcDay(t) }) },
       tools: ["priors_check", ...MCP_READ_TOOLS, "time_left"],
       recipes: recipeList(),
-      endpoints: { manifest: "GET /manifest", quote: "POST /quote", hire: "POST /jobs", recipes: "GET /recipes", recipe: "POST /recipes/{key}", job: "GET /jobs/{id}" },
+      endpoints: { manifest: "GET /manifest", quote: "POST /quote", hire: "POST /jobs", hireWorker: "POST /jobs {agentId, minutes, task}: that worker's time (POST /quote takes agentId too)", recipes: "GET /recipes", recipe: "POST /recipes/{key}", job: "GET /jobs/{id}" },
     };
   }
 
@@ -128,16 +141,25 @@ export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox
 
   /**
    * Assign a worker and record a quote, inside the lock. Refuses (503) when the day's model budget is spent, and when
-   * no worker can take this payment (`eligible`: for USDG, a worker the facilitator settles for).
+   * no worker can take this payment (`eligible`: for USDG, a worker the facilitator settles for). `agentId`: the worker
+   * the request names (404 when none here is that agent); null: the least-loaded of the workers that are not hire-only.
    */
-  async function newQuote(fields, eligible = () => true) {
+  async function newQuote(fields, eligible = () => true, agentId = null) {
     return lock(async () => {
       checkCanTakeJob(await store.get("ledger"), caps, now()); // throws DailyCapReached: no quote, no 402
       const fleet = await getFleet();
-      const load = Object.fromEntries(workers.map((w) => [w.id, eligible(w) ? counters(fleet, w.id).active : Infinity]));
-      const i = pickWorker(workers, load, fleet.last);
-      if (i < 0) throw Object.assign(new Error("USDG over x402 is not set up on this service (no facilitator API key): pay in PRIORS (POST /quote)"), { status: 503, code: "usdg_unavailable" });
-      fleet.last = i;
+      let i;
+      if (agentId !== null) {
+        i = workers.findIndex((w) => w.agentId === agentId);
+        if (i < 0) throw Object.assign(new Error(`no worker here is agent #${agentId}: see GET /manifest`), { status: 404, code: "unknown_worker" });
+        if (!eligible(workers[i])) throw Object.assign(new Error(`agent #${agentId} cannot be paid this way here (no facilitator API key for it): pay in PRIORS (POST /quote)`), { status: 503, code: "usdg_unavailable" });
+      } else {
+        const anyPool = workers.some((w) => !w.hireOnly);
+        const load = Object.fromEntries(workers.map((w) => [w.id, eligible(w) && !(anyPool && w.hireOnly) ? counters(fleet, w.id).active : Infinity]));
+        i = pickWorker(workers, load, fleet.last);
+        if (i < 0) throw Object.assign(new Error("USDG over x402 is not set up on this service (no facilitator API key): pay in PRIORS (POST /quote)"), { status: 503, code: "usdg_unavailable" });
+        fleet.last = i;
+      }
       const w = workers[i];
       const t = now();
       const quote = { id: newId("q"), workerId: w.id, payTo: w.address, createdAt: t, status: "open", ...fields(t) };
@@ -161,12 +183,13 @@ export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox
     const body = request.method === "GET" ? Object.fromEntries(url.searchParams) : await readBody(request);
     const minutes = checkMinutes(body.minutes, settings);
     if (!isAddress(body.payer)) throw new BadRequest("payer: the address that will send the PRIORS transfer (an EOA); the quote is bound to it", "bad_payer");
+    const agentId = agentIdOf(body);
     const amount = priceFor(minutes, settings.ratePriorsAtomic);
     await prune();
     const { quote, worker } = await newQuote((t) => ({
       method: "transfer", token: "PRIORS", minutes, amount: amount.toString(), payer: body.payer,
       expiresAt: t + settings.priorsQuoteSeconds * 1000, claimUntil: t + settings.claimWindowHours * 3600_000,
-    }));
+    }), undefined, agentId);
     log?.info?.(`quote ${quote.id}: ${minutes} min for ${formatAtomic(amount, PRIORS.decimals)} PRIORS to ${worker.id}`);
     return json(200, {
       quote: quote.id,
@@ -190,8 +213,9 @@ export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox
     const body = await readBody(request);
     const minutes = checkMinutes(body.minutes, settings);
     const task = checkTask(body.task);
-    if (body.payment !== undefined) return priorsJob(body, minutes, task);
-    const order = { minutes, task, taskHash: await sha256Hex(task), amount: priceFor(minutes, settings.rateUsdgAtomic), recipe: null };
+    const agentId = agentIdOf(body);
+    if (body.payment !== undefined) return priorsJob(body, minutes, task, agentId);
+    const order = { minutes, task, taskHash: await sha256Hex(task), amount: priceFor(minutes, settings.rateUsdgAtomic), recipe: null, agentId };
     return usdgOrder(request, url, "/jobs", order, (w, amount) => `${minutes} minute(s) of agent002 worker ${w.id}'s time: ${amount} USDG to ${w.address}`);
   }
 
@@ -228,7 +252,7 @@ export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox
     const { minutes, taskHash, recipe } = order;
     const amount = formatAtomic(order.amount, USDG.decimals);
     await prune();
-    const { quote, worker } = await newQuote((t) => ({ method: "x402", token: "USDG", minutes, amount: order.amount.toString(), taskHash, ...(recipe ? { recipe } : {}), expiresAt: t + settings.x402QuoteSeconds * 1000 }), (w) => !!facilitatorFor(w));
+    const { quote, worker } = await newQuote((t) => ({ method: "x402", token: "USDG", minutes, amount: order.amount.toString(), taskHash, ...(recipe ? { recipe } : {}), expiresAt: t + settings.x402QuoteSeconds * 1000 }), (w) => !!facilitatorFor(w), order.agentId ?? null);
     const requirement = requirementFor(quote, { maxTimeoutSeconds: settings.x402QuoteSeconds });
     const pr = paymentRequired({
       requirement,
@@ -256,6 +280,7 @@ export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox
       if (quote.status === "settling") throw new PaymentRefused("settling", "this payment is being settled: send the same request again in a few seconds", { status: 409, retry: true });
       if (quote.status === "unsettled" && quote.nonce !== nonce) throw new PaymentRefused("unsettled", "this quote has a payment whose settlement is unconfirmed: send that same payment again to reconcile it", { status: 409 });
       if (quote.minutes !== minutes || quote.taskHash !== taskHash || (quote.recipe ?? null) !== order.recipe) throw new BadRequest("this payment's quote was for another job (other minutes, task, recipe or input): send this job unpaid for its own 402", "quote_mismatch");
+      if (order.agentId != null && byId.get(quote.workerId)?.agentId !== order.agentId) throw new BadRequest("this payment's quote was for another worker than the agentId named: send this job unpaid for its own 402", "quote_mismatch");
       const requirement = requirementFor(quote, { maxTimeoutSeconds: settings.x402QuoteSeconds });
       if (!sameRequirement(payment.accepted, requirement)) throw new PaymentRefused("requirement_mismatch", "the payment does not accept the requirement this quote issued (amount, asset, network or payTo differ)");
       if (quote.status === "open" && quote.expiresAt < now()) throw new PaymentRefused("quote_expired", "this quote expired: send the request without payment for a fresh 402");
@@ -345,7 +370,7 @@ export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox
   }
 
   /** PRIORS: the transfer named by txHash pays for the quote, or the request is refused with the reason. */
-  async function priorsJob(body, minutes, task) {
+  async function priorsJob(body, minutes, task, agentId = null) {
     const p = body.payment;
     if (!p || typeof p !== "object") throw new BadRequest("payment must be an object: {\"token\": \"PRIORS\", \"txHash\": \"0x...\"}", "bad_payment");
     if (p.token !== "PRIORS") throw new BadRequest("payment.token must be \"PRIORS\"; USDG is paid over x402 (send the request without payment for a 402)", "bad_token");
@@ -360,6 +385,7 @@ export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox
     if (!quote || quote.method !== "transfer") throw new PaymentRefused("unknown_quote", "unknown quote: ask POST /quote before transferring", { status: 400 });
     if (quote.status === "used") throw new PaymentRefused("quote_used", `this quote was already paid for (job ${quote.jobId})`, { status: 409 });
     if (quote.minutes !== minutes) throw new BadRequest(`this quote is for ${quote.minutes} minute(s), not ${minutes}`, "quote_mismatch");
+    if (agentId !== null && byId.get(quote.workerId)?.agentId !== agentId) throw new BadRequest(`this quote is for another worker than agent #${agentId}`, "quote_mismatch");
     if (now() > quote.claimUntil) throw new PaymentRefused("claim_window", `this quote could be claimed until ${new Date(quote.claimUntil).toISOString()}`);
 
     const chain = await readPriorsTransfer(rpc, txHash);
@@ -586,7 +612,8 @@ export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox
     const path = url.pathname.replace(/\/+$/, "") || "/";
     try {
       if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
-      if (request.method === "GET" && (path === "/" || path === "/manifest")) return json(200, await manifest(settings.publicUrl || url.origin));
+      // compact: a manifest with many workers stays small for the boards that read it (64 KB at most on Priors')
+      if (request.method === "GET" && (path === "/" || path === "/manifest")) return json(200, await manifest(settings.publicUrl || url.origin), {}, { compact: true });
       if (path === "/quote" && (request.method === "POST" || request.method === "GET")) return await priorsQuote(request, url);
       if (path === "/jobs" && request.method === "POST") return await postJob(request, url);
       if (path === "/recipes" && request.method === "GET") return json(200, { recipes: recipeList() });

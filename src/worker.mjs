@@ -8,7 +8,8 @@
 //               never runs the job twice.
 //
 // Settings come from wrangler.jsonc's `vars` and from secrets (src/settings.mjs): the workers' wallet addresses and
-// ERC-8004 ids as vars; OPENROUTER_API_KEY and each worker's AGENT002_FACILITATOR_KEY_<n> as secrets. The Worker needs
+// ERC-8004 ids as vars, the hire-only workers as AGENT002_HIRE_WORKERS; OPENROUTER_API_KEY, each worker's
+// AGENT002_FACILITATOR_KEY_<n> and the hire-only workers' AGENT002_HIRE_FACILITATOR_KEY as secrets. The Worker needs
 // no worker key: it only receives payments. (A Worker entry module exports only handlers and classes: the helpers
 // below stay private.)
 import { DurableObject } from "cloudflare:workers";
@@ -51,9 +52,12 @@ export class Desk extends DurableObject {
   build() {
     const settings = workerSettings(this.env);
     const clients = new Map();
+    // the hire-only workers share one key (AGENT002_HIRE_FACILITATOR_KEY), and so one client
+    const hire = settings.hireFacilitatorKey ? priorsFacilitatorClient({ url: settings.facilitatorUrl, apiKey: settings.hireFacilitatorKey }) : null;
     for (const w of settings.workers) {
       const apiKey = settings.facilitatorKeys[w.id];
       if (apiKey) clients.set(w.id, priorsFacilitatorClient({ url: settings.facilitatorUrl, apiKey }));
+      else if (w.hireOnly && hire) clients.set(w.id, hire);
     }
     return makeDesk({
       settings,
