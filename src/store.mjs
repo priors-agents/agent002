@@ -2,7 +2,8 @@
 // runs on a JSON file in Node and on a Durable Object's storage in a Cloudflare Worker. Values are plain JSON
 // (amounts as decimal strings). Keys:
 //
-//   fleet            assignment cursor and per-worker counters (queued+running, running, done, earned)
+//   fleet            assignment cursor and per-worker counters (queued+running, running, done, earned; `internal`: the
+//                    same for the jobs internal payers paid, apart from the public ones)
 //   ledger           the day's model spend and the running jobs' reservations (src/budget.mjs)
 //   queue            ids of the paid jobs waiting for their worker, oldest first
 //   quote:<id>       a quote: worker, minutes, price, payer (PRIORS), status

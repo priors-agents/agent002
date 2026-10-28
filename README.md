@@ -189,6 +189,11 @@ own registry wallet, listed in the manifest with `hireOnly: true`. A hire-only w
 (`agentId`); a job that names no worker goes to the numbered workers, as above. The service holds no key of theirs:
 it only quotes their wallet, and their payments settle with one facilitator API key (`AGENT002_HIRE_FACILITATOR_KEY`).
 
+The manifest counts each worker's jobs (`jobsDone`, `jobsActive`) and what they earned (`earned`). A job paid by one of
+the operator's own wallets (`AGENT002_INTERNAL_PAYERS`) is quoted, paid, settled and run like any other, and its worker
+is paid as for any other, but those counters leave it out: they show what others bought, never the operator's own use.
+The list lives in the deployment's variables, and nothing the service answers names it.
+
 `agent002 join` registers an ERC-8004 identity for each worker (one transaction each, from the worker's own wallet),
 so each has a Priors record: `https://priors.trade/agent?id=<id>`, linked from the manifest (before a worker has an
 identity, the link goes by its wallet). What buyers pay a worker is income on that record. Each worker's badge above
@@ -335,6 +340,7 @@ All from the environment, the same names in Node and in the Worker (`vars` and s
 | `AGENT002_FACILITATOR_KEY_<n>` | `.agent002/merchant.json` | secret: worker n's facilitator API key |
 | `AGENT002_HIRE_WORKERS` (then `_2`, `_3`, ...) | none | hire-only workers, `agentId:wallet,agentId:wallet,...` (each wallet the agent's registry wallet); a Worker variable holds about 5 KB, so a long list goes on in `_2`, `_3`... |
 | `AGENT002_HIRE_FACILITATOR_KEY` | none | secret: the facilitator API key that settles the hire-only workers' payments |
+| `AGENT002_INTERNAL_PAYERS` (then `_2`, `_3`, ...) | none | the operator's own payer wallets, `0x...,0x...`: their jobs run as any other, and the manifest's `jobsDone`, `jobsActive` and `earned` leave them out; about 110 addresses a variable |
 | `OPENROUTER_API_KEY` | none | secret: the model provider's key |
 
 ## Security

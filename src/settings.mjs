@@ -26,6 +26,10 @@
 //                                  (a hosting platform's variable holds a few KB). A hire-only worker takes only the jobs
 //                                  that name it (POST /jobs {agentId, ...}); jobs that name none go to the workers above
 //   AGENT002_HIRE_FACILITATOR_KEY  secret: the Priors facilitator API key that settles for the hire-only workers
+//   AGENT002_INTERNAL_PAYERS       the operator's own payer wallets: "0x...,0x...", continued in AGENT002_INTERNAL_PAYERS_2,
+//                                  _3... A job one of them pays is quoted, paid, settled and run as any other; the manifest's
+//                                  public counters (a worker's jobsDone, jobsActive, earned) leave it out, so the operator's
+//                                  own use never reads as demand. Set it in the deployment's variables; nothing answers it
 //   OPENROUTER_API_KEY             secret: the model provider's key
 import { computeAddress, getAddress } from "ethers";
 import { PUBLIC_RPC, USDG, PRIORS, isAddress } from "./chain.mjs";
@@ -111,6 +115,25 @@ export function hireWorkersFromEnv(env) {
   return out;
 }
 
+/** AGENT002_INTERNAL_PAYERS, then _2 up to this: how many variables the internal payers may span. */
+export const MAX_INTERNAL_VARS = 20;
+
+/** The internal payers: AGENT002_INTERNAL_PAYERS, then _2, _3... (addresses, comma-separated), as a Set of lower-case
+ *  addresses. Nothing the service answers names them. */
+export function internalPayersFromEnv(env) {
+  const out = new Set();
+  for (let k = 1; k <= MAX_INTERNAL_VARS; k++) {
+    const name = k === 1 ? "AGENT002_INTERNAL_PAYERS" : `AGENT002_INTERNAL_PAYERS_${k}`;
+    const raw = str(env, name, null);
+    if (raw === null) continue;
+    for (const item of raw.split(",").map((x) => x.trim()).filter(Boolean)) {
+      if (!/^0x[0-9a-fA-F]{40}$/.test(item)) throw new Error(`${name}: ${JSON.stringify(item.slice(0, 60))} is not an address`);
+      out.add(item.toLowerCase());
+    }
+  }
+  return out;
+}
+
 /** AGENT002_FACILITATOR_KEY_<n>, by worker id; registered as secrets. */
 export function facilitatorKeysFromEnv(env) {
   const keys = {};
@@ -175,6 +198,7 @@ export function settingsFromEnv(env = {}, { workers: baseWorkers = null } = {}) 
       ids.add(w.agentId);
     }
   }
+  s.internalPayers = internalPayersFromEnv(env);
   s.facilitatorKeys = facilitatorKeysFromEnv(env);
   s.hireFacilitatorKey = str(env, "AGENT002_HIRE_FACILITATOR_KEY", null);
   if (s.hireFacilitatorKey) addSecret(s.hireFacilitatorKey);

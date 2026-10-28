@@ -85,6 +85,10 @@ export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox
 
   const emptyFleet = () => ({ last: -1, workers: {} });
   const counters = (fleet, id) => (fleet.workers[id] ??= { active: 0, running: 0, done: 0, failed: 0, earned: { USDG: "0", PRIORS: "0" } });
+  // A job an internal payer paid (AGENT002_INTERNAL_PAYERS: the operator's own wallets) runs as any other and takes its
+  // worker's time (`active`, `running`), but is counted apart (`internal`): the manifest's public counters leave it out.
+  const internalOf = (c) => (c.internal ??= { active: 0, done: 0, failed: 0, earned: { USDG: "0", PRIORS: "0" } });
+  const isInternal = (payer) => !!settings.internalPayers?.has(String(payer || "").toLowerCase());
   const getFleet = async () => (await store.get("fleet")) || emptyFleet();
 
   // ---- the manifest --------------------------------------------------------------------------------------------
@@ -126,7 +130,7 @@ export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox
         const c = counters(fleet, w.id);
         // a hire-only worker's entry leaves out its record link (the agent id gives it): a fleet of a few hundred stays
         // well under the 64 KB a board reads of a manifest
-        return { ...publicWorker(w), ...(w.hireOnly ? { hireOnly: true } : { record: recordLink({ agentId: w.agentId, wallet: w.address, sandbox }) }), jobsDone: c.done, jobsActive: c.active, earned: { USDG: formatAtomic(c.earned.USDG, USDG.decimals), PRIORS: formatAtomic(c.earned.PRIORS, PRIORS.decimals) } };
+        return { ...publicWorker(w), ...(w.hireOnly ? { hireOnly: true } : { record: recordLink({ agentId: w.agentId, wallet: w.address, sandbox }) }), jobsDone: c.done, jobsActive: Math.max(0, c.active - (c.internal?.active || 0)), earned: { USDG: formatAtomic(c.earned.USDG, USDG.decimals), PRIORS: formatAtomic(c.earned.PRIORS, PRIORS.decimals) } };
       }),
       model: { name: settings.model, jobSpendCapUsd: caps.jobCapUsd, dailySpendCapUsd: caps.dailyCapUsd, dailyLeftUsd: left, accepting: left + 1e-9 >= caps.jobCapUsd, ...(left + 1e-9 >= caps.jobCapUsd ? {} : { reopensAt: nextUtcDay(t) }) },
       tools: ["priors_check", ...MCP_READ_TOOLS, "time_left"],
@@ -429,7 +433,9 @@ export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox
   /** Inside the lock: store the job, count it against its worker, put it at the back of the queue. */
   async function enqueue(job) {
     const fleet = await getFleet();
-    counters(fleet, job.workerId).active++;
+    const c = counters(fleet, job.workerId);
+    c.active++;
+    if (isInternal(job.payment?.payer)) { job.internal = true; internalOf(c).active++; }
     const queue = (await store.get("queue")) || [];
     queue.push(job.id);
     await store.put(`job:${job.id}`, job);
@@ -511,8 +517,11 @@ export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox
       const c = counters(fleet, j.workerId);
       c.active = Math.max(0, c.active - 1);
       c.running = Math.max(0, c.running - 1);
-      if (status === "done") c.done++; else c.failed++;
-      c.earned[j.payment.token] = (BigInt(c.earned[j.payment.token] || "0") + BigInt(j.payment.amount)).toString();
+      // the public counters, or the internal ones for a job an internal payer paid
+      const k = j.internal ? internalOf(c) : c;
+      if (j.internal) k.active = Math.max(0, k.active - 1);
+      if (status === "done") k.done++; else k.failed++;
+      k.earned[j.payment.token] = (BigInt(k.earned[j.payment.token] || "0") + BigInt(j.payment.amount)).toString();
       await store.put("fleet", fleet);
       return j;
     });
