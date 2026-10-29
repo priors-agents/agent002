@@ -11,7 +11,7 @@ import { ethers } from "ethers";
 import { decodePaymentRequiredHeader, decodePaymentResponseHeader } from "@x402/core/http";
 import { settingsFromEnv } from "../src/settings.mjs";
 import { DESK, maxPromptChars } from "../src/stock-desk.mjs";
-import { MIN_TOKENS } from "../src/model.mjs";
+import { MIN_TOKENS, stubModel } from "../src/model.mjs";
 import { USDG } from "../src/chain.mjs";
 import { env, sign, setup, fakeFacilitator } from "./support.mjs";
 
@@ -229,6 +229,14 @@ test("a long brief reaches the model whole (up to the brief's bound), not cut at
   assert.equal(paid.status, 200);
   assert.ok(s.model.seen[0].history[0].text.includes(long.trim()));
   assert.doesNotMatch(s.model.seen[0].history[0].text, /\[cut at/);
+});
+
+test("on the deterministic stub model (AGENT002_MODEL=stub, the sandbox): a brief is written in its two steps and sold", async () => {
+  const s = setup({ ...DESKS }, { modelFor: async () => stubModel(), briefs: fakeBriefs() });
+  const { paid, body } = await buy(s.call, ethers.Wallet.createRandom(), IDS[0]);
+  assert.equal(paid.status, 200, JSON.stringify(body).slice(0, 200));
+  assert.match(body.summary, /stub answer/);
+  assert.equal(body.receipt.steps, 2);
 });
 
 test("the same signed payment sent again returns the same brief: settled once, written once", async () => {

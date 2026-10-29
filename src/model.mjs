@@ -114,7 +114,8 @@ export const STUB_COST_USD = 0.0001;
 
 /**
  * The deterministic stub (AGENT002_MODEL=stub): no language model and no network. Its first step calls the local
- * `time_left` tool, its second answers with a fixed text built from the task. Same task, same answer.
+ * `time_left` tool, its second answers with a fixed text built from the task (also when the job's last step asked it to
+ * answer after that result: a brief's two steps, src/stock-desk.mjs). Same task, same answer.
  */
 export function stubModel() {
   return {
@@ -122,9 +123,9 @@ export function stubModel() {
     estimateUsd: () => STUB_COST_USD,
     maxTokensFor: (budgetUsd) => (budgetUsd + 1e-12 >= STUB_COST_USD ? 256 : 0),
     async complete({ history }) {
-      const last = history[history.length - 1];
+      const last = [...history].reverse().find((h) => h.results);
       const task = history.find((h) => h.role === "user" && typeof h.text === "string")?.text || "";
-      if (last.results) {
+      if (last) {
         const tl = last.results.find((x) => x.name === "time_left");
         return {
           text: `agent002 stub answer (deterministic, no language model) for the task: "${task.slice(0, 200)}". Steps: 2; tool used: ${tl ? "time_left" : "none"}.`,
