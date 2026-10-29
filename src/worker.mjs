@@ -10,8 +10,9 @@
 // Settings come from wrangler.jsonc's `vars` and from secrets (src/settings.mjs): the workers' wallet addresses and
 // ERC-8004 ids as vars, the hire-only workers as AGENT002_HIRE_WORKERS; OPENROUTER_API_KEY, each worker's
 // AGENT002_FACILITATOR_KEY_<n> and the hire-only workers' AGENT002_HIRE_FACILITATOR_KEY as secrets. The Worker needs
-// no worker key: it only receives payments. (A Worker entry module exports only handlers and classes: the helpers
-// below stay private.)
+// no worker key: it only receives payments. The stock desks (AGENT002_STOCK_DESKS, src/stock-desk.mjs) take their
+// briefs from the service binding STOCK_BRIEFS, a Worker entrypoint with status(), brief() and check(); without it,
+// they take no job. A desk-only worker (AGENT002_STOCK_DESKS agentId:wallet) settles with the hire-only workers' key. (A Worker entry module exports only handlers and classes: the helpers below stay private.)
 import { DurableObject } from "cloudflare:workers";
 import { priorsFacilitatorClient } from "@priors/x402";
 import { makeDesk, json } from "./desk.mjs";
@@ -67,6 +68,8 @@ export class Desk extends DurableObject {
       facilitatorFor: (w) => clients.get(w.id) || null,
       rpc: jsonRpc(settings.rpc),
       log,
+      briefs: this.env.STOCK_BRIEFS ?? null, // RPC: status({ agentId }), brief({ agentId, token }), check(text)
+      modelFor: () => makeModel(settings),
     });
   }
 

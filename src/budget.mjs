@@ -38,18 +38,19 @@ export function availableUsd(ledger, dailyCapUsd, now) {
   return usd8(dailyCapUsd - l.spentUsd - sum(l.reserved));
 }
 
-/** Throws DailyCapReached unless a whole per-job cap still fits in the day. */
-export function checkCanTakeJob(ledger, { dailyCapUsd, jobCapUsd }, now) {
+/** Throws DailyCapReached unless a whole per-job cap still fits in the day. `what`: whose budget it is, for the
+ *  refusal (the deployment's, or one agent's own: src/desk.mjs). */
+export function checkCanTakeJob(ledger, { dailyCapUsd, jobCapUsd }, now, what = "the daily model budget") {
   const left = availableUsd(ledger, dailyCapUsd, now);
   if (left + 1e-9 < jobCapUsd) {
-    throw new DailyCapReached(`the daily model budget is spent ($${usd8(dailyCapUsd - left)} of $${dailyCapUsd} used or held by running jobs): no new jobs until ${nextUtcDay(now)}, nothing was charged`);
+    throw new DailyCapReached(`${what} is spent ($${usd8(dailyCapUsd - left)} of $${dailyCapUsd} used or held by running jobs): no new jobs until ${nextUtcDay(now)}, nothing was charged`);
   }
   return left;
 }
 
 /** Hold `jobCapUsd` for `jobId`; returns the new ledger. Throws DailyCapReached when it does not fit. */
-export function reserve(ledger, jobId, { dailyCapUsd, jobCapUsd }, now) {
-  checkCanTakeJob(ledger, { dailyCapUsd, jobCapUsd }, now);
+export function reserve(ledger, jobId, { dailyCapUsd, jobCapUsd }, now, what) {
+  checkCanTakeJob(ledger, { dailyCapUsd, jobCapUsd }, now, what);
   const l = rollLedger(ledger, now);
   l.reserved[jobId] = jobCapUsd;
   return l;

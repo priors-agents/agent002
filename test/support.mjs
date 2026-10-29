@@ -1,4 +1,4 @@
-// What the network-free service tests share (test/desk.test.mjs, test/recipes.test.mjs): three worker wallets, a
+// What the network-free service tests share (test/desk.test.mjs, test/recipes.test.mjs, test/stock-desk.test.mjs): three worker wallets, a
 // facilitator stand-in that checks the buyer's real EIP-3009 signature, a buyer signing what a 402 asks, a chain
 // stand-in JSON-RPC, and a desk on an in-memory store with the deterministic stub model.
 import { ethers } from "ethers";
@@ -81,12 +81,11 @@ export function fakeChain() {
 
 const noTools = () => ({ defs: async () => [], run: async () => ({ text: "", isError: true }) });
 
-export function setup(over = {}, { modelFor = async () => stubModel(), facilitatorFor = null, toolbox = noTools } = {}) {
+export function setup(over = {}, { modelFor = async () => stubModel(), facilitatorFor = null, toolbox = noTools, briefs = null, facilitator = fakeFacilitator() } = {}) {
   const settings = settingsFromEnv(env(over));
-  const facilitator = fakeFacilitator();
   const chain = fakeChain();
   const store = memoryStore();
-  const desk = makeDesk({ settings, store, runner: localRunner({ settings, toolbox, modelFor }), facilitatorFor: facilitatorFor ? (w) => facilitatorFor(w, facilitator) : () => facilitator, rpc: chain.rpc, sandbox: false });
+  const desk = makeDesk({ settings, store, runner: localRunner({ settings, toolbox, modelFor }), facilitatorFor: facilitatorFor ? (w) => facilitatorFor(w, facilitator) : () => facilitator, rpc: chain.rpc, sandbox: false, briefs, modelFor });
   const call = (method, path, body, headers = {}) => desk.handle(new Request(`http://agent002.test${path}`, { method, headers: { "content-type": "application/json", ...headers }, body: body === undefined ? undefined : JSON.stringify(body) }));
   return { settings, facilitator, chain, store, desk, call };
 }

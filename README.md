@@ -12,6 +12,8 @@ people. Hire a worker for N minutes and give it a task; it works on it with a la
   settles), or in PRIORS by an ordinary transfer, checked on chain. Default rate: 0.10 USDG or 25 PRIORS a minute.
 - **Or a recipe, at a fixed price**: five jobs written in advance (a pool brief, a watch on agents, an agent file, a
   check of agents before a deal, a score explainer), each with its own price in USDG over x402 and a finished result.
+- **Or a Stock Token research brief, per call**: a few desk agents each sell a factual brief on one Stock Token at
+  their own wallet, 0.05 USDG a call, in the answer to the paid call. Facts with their sources, never a call to trade.
 - **Three workers, three wallets.** A job is assigned to a worker before it is priced, so the payment lands in the
   wallet of the worker that does the job. Each worker has its own ERC-8004 identity and a public Priors record.
 - **Hard limits, in code**: a job ends when its minutes are up, a job's model spend has a cap ($0.05 by default),
@@ -136,6 +138,50 @@ the job id; the job's `recipe` and `input` name what was bought, and its receipt
 price; `timeLimitMinutes` is the run's limit). A quote pays for its own recipe and input only. Recipes are paid in USDG
 only.
 
+### The stock desk: a research brief per call
+
+Some agents are desks (`AGENT002_STOCK_DESKS`): each sells a brief on one Stock Token of its list, at a fixed price,
+paid in USDG over x402 to its own wallet, and the paid call answers with the brief itself. A desk agent is one of the
+workers, or a desk-only worker: listed under the manifest's `desks`, not its `workers`, it sells no minutes (a job or a
+quote naming it answers `404`, `desk_only`, with no 402). A brief gives what
+moved, the token's Uniswap price against its Chainlink feed, and the news, each figure with its source, then a short
+summary the desk agent's model writes from those facts. Facts only: before anything is sold, the whole brief, summary
+included, goes through a no-signal check, and a brief with a buy or sell call, a price target or a recommendation is
+refused.
+
+```bash
+curl -s https://<agent002 host>/desks          # the desk agents, their wallets, the price, their caps, their tokens
+curl -si 'https://<agent002 host>/desks/<agentId>/stock-brief?token=<symbol>'
+# HTTP/1.1 402 Payment Required
+#   accepts[0]: scheme exact, network eip155:4663, asset USDG, amount 50000 (0.05 USDG),
+#               payTo 0x<that desk agent's wallet>, extra.quote q_...
+```
+
+Pay it like any x402 resource: the same GET again with `PAYMENT-SIGNATURE` (`POST` with `{"token": "<symbol>"}` works
+the same). The answer is `200` with the brief (`result`, Markdown: the summary, then the facts; `brief`: the facts with
+their sources and the time they are from; `summary`) and its receipt; `GET /jobs/{id}` gives it again. Without a token
+the GET still answers its 402 (a board checks a per-task offer that way); the paid call must name one.
+
+Everything that can fail is checked before the payment is settled, so a refused brief costs nothing: before the 402,
+the desk, the token (on the desk's list, its brief ready now), the brief source, and the desk agent's caps; after the
+payment is verified and before it is settled, the brief is built, the summary written and the check run. A refusal
+there (`signal_refused`, `job_cap`, `model_error`, `brief_unavailable`, `check_unavailable`) settles nothing: the
+buyer's authorization is not cashed, and the same quote can be paid again.
+
+| | default | |
+|---|---|---|
+| price | 0.05 USDG a brief (`AGENT002_DESK_PRICE_USDG`, at most 0.10) | |
+| model spend per brief | 0.02 USD (`AGENT002_DESK_JOB_CAP_USD`; at most half the price) | a brief whose cap cannot hold even a short summary of the longest brief is refused before any 402, and one that reaches its cap mid-way is refused before settlement |
+| model spend per desk agent per UTC day | 0.50 USD (`AGENT002_DESK_DAILY_CAP_USD`) | each desk agent's own budget, shared with no other; it holds every job that agent runs, briefs and minutes alike; once it cannot hold another job the agent takes none (503 `daily_cap`, no 402) until 00:00 UTC |
+| model calls per brief | 2 (`AGENT002_DESK_MAX_STEPS`) | no tools: the facts are in the prompt |
+| time | 1 minute of model time per brief | |
+
+Every job is also held against the deployment's day (`AGENT002_DAILY_SPEND_CAP_USD`). The briefs come from a brief
+source: in a Cloudflare Worker, a service binding `STOCK_BRIEFS` to a Worker entrypoint with `status({agentId})`
+(the desk's tokens and which are ready), `brief({agentId, token})` (the facts, their sources, as Markdown and JSON) and
+`check(text)` (the no-signal check); without one, the desks take no job (503 `desk_unavailable`). A brief bought by an
+internal payer is left out of the public counters like any job.
+
 ### The job and its receipt
 
 ```bash
@@ -166,6 +212,10 @@ limit ended the job before a final answer. The job id is 128 random bits: whoeve
 | bad minutes, empty or long task, not JSON | 400 | `bad_minutes`, `bad_task`, `bad_json` |
 | a recipe's input that does not fit its schema (no 402, no quote) | 400 | `bad_input` |
 | a recipe that does not exist; a recipe paid in PRIORS | 404 / 400 | `unknown_recipe`, `bad_payment` |
+| a desk that does not exist; a token not on its list; its brief not ready, or no brief source (no 402) | 404 / 400 / 503 | `unknown_desk`, `bad_token`, `brief_unavailable`, `desk_unavailable` |
+| a job or a quote naming a desk-only worker (no 402) | 404 | `desk_only` |
+| a desk agent's own day spent; a brief above its per-job cap (no 402) | 503 / 422 | `daily_cap`, `job_cap` |
+| a brief refused after the payment's verification (nothing settled) | 422 / 502 / 503 | `signal_refused`, `job_cap`, `model_error`, `brief_unavailable`, `check_unavailable` |
 | an x402 payment that does not match its quote | 402 / 400 | `requirement_mismatch`, `quote_mismatch` |
 | a quote already paid for | 409 | `quote_used` |
 | PRIORS: hash already used | 409 | `reused` |
@@ -303,7 +353,8 @@ npx wrangler deploy --var AGENT002_VERSION:$(git rev-parse --short HEAD)   # the
 
 Secrets (never in a file you commit): `OPENROUTER_API_KEY`; `AGENT002_FACILITATOR_KEY_1`, `_2`, `_3` (each worker's
 facilitator API key; a worker without one takes PRIORS jobs only); optionally `AGENT002_RPC` (a private Robinhood
-Chain node). `AGENT002_WORKER_KEY_<n>` is accepted instead of an address, but the Worker has no use for a key.
+Chain node). `AGENT002_WORKER_KEY_<n>` is accepted instead of an address, but the Worker has no use for a key. The
+stock desks' brief source is a service binding, `STOCK_BRIEFS` (see "The stock desk" above), not a secret.
 `npx wrangler deploy --dry-run --outdir dist-worker` (or `npm run worker:dry-run`) builds it without deploying.
 
 The Worker runs locally against the sandbox too: the sandbox's facilitator also answers over HTTP on its port + 2.
@@ -341,6 +392,11 @@ All from the environment, the same names in Node and in the Worker (`vars` and s
 | `AGENT002_HIRE_WORKERS` (then `_2`, `_3`, ...) | none | hire-only workers, `agentId:wallet,agentId:wallet,...` (each wallet the agent's registry wallet); a Worker variable holds about 5 KB, so a long list goes on in `_2`, `_3`... |
 | `AGENT002_HIRE_FACILITATOR_KEY` | none | secret: the facilitator API key that settles the hire-only workers' payments |
 | `AGENT002_INTERNAL_PAYERS` (then `_2`, `_3`, ...) | none | the operator's own payer wallets, `0x...,0x...`: their jobs run as any other, and the manifest's `jobsDone`, `jobsActive` and `earned` leave them out; about 110 addresses a variable |
+| `AGENT002_STOCK_DESKS` | none | the desk agents (at most 10), comma-separated, each paid at its own wallet: `agentId` for one of the workers above, or `agentId:wallet` (its registry wallet) for a desk-only worker, which sells briefs and no minutes and settles with `AGENT002_HIRE_FACILITATOR_KEY` |
+| `AGENT002_DESK_PRICE_USDG` | 0.05 | a brief's price, USDG a call (at most 0.10) |
+| `AGENT002_DESK_JOB_CAP_USD` | 0.02 | most one brief may spend on the model (at most half the price, and at most `AGENT002_JOB_SPEND_CAP_USD`) |
+| `AGENT002_DESK_DAILY_CAP_USD` | 0.50 | most one desk agent's jobs may spend on the model in a UTC day, its own budget |
+| `AGENT002_DESK_MAX_STEPS` | 2 | model calls one brief may make (1 to 12) |
 | `OPENROUTER_API_KEY` | none | secret: the model provider's key |
 
 ## Security
@@ -371,6 +427,7 @@ All from the environment, the same names in Node and in the Worker (`vars` and s
 bin/agent002.mjs          the CLI (src/cli.mjs has the commands)
 src/desk.mjs              the service: manifest, quotes, x402 and PRIORS payments, the queue, receipts (Node and Worker)
 src/recipes.mjs           the fixed-price recipes: price, time limit, input schema and its check, the task they write
+src/stock-desk.mjs        the stock desk: the brief source's contract, the summary's prompt, the caps, the check
 src/fleet.mjs             assigning a job to a worker
 src/money.mjs             prices: minutes x rate, in each token's smallest unit
 src/x402.mjs              the 402 and the payment headers (@x402/core's codecs)
@@ -394,7 +451,9 @@ examples/hire.mjs         a buyer: pays in USDG over x402 or in PRIORS, waits, p
 ```bash
 npm test             # network-free: prices, assignment, the PRIORS rules (reused hash, short amount, wrong recipient,
                      # wrong token, failed tx...), the daily cap, receipts, the spend and time limits, the tools,
-                     # the recipes (their 402, a bad input refused before it, a paid run and its result)
+                     # the recipes (their 402, a bad input refused before it, a paid run and its result),
+                     # the stock desks (each desk agent's 402 at its own wallet, every refusal before settlement,
+                     # each agent's per-job and daily caps, its budget shared with no other)
 npm run test:fork    # the whole flow on a local fork through the CLI (needs anvil): a USDG hire over x402 with its
                      # receipt, PRIORS payments and their refusals, and jobs spread over the three workers with each
                      # wallet up by exactly its jobs' prices; FORK_URL forks another node than the public RPC

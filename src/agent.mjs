@@ -41,9 +41,10 @@ const isAbort = (e) => e?.name === "TimeoutError" || e?.name === "AbortError";
  * Run `job` on `worker`. Resolves to the outcome (never throws for a model or tool failure: those end the job as
  * "failed" with what was spent):
  *   { status: "done"|"failed", result, error, modelSpendUsd, steps, toolCalls, stoppedBy, startedAt, finishedAt }
- * `spentUsd`: what this job already spent (a resumed job); `onSpend(total)` is told after every call.
+ * `spentUsd`: what this job already spent (a resumed job); `onSpend(total)` is told after every call. `system`: another
+ * system prompt than a worker's (a stock desk's brief, src/stock-desk.mjs); `tools: false` offers the model no tool.
  */
-export async function runJob({ job, worker, model, toolbox, spendCapUsd, deadline, spentUsd = 0, now = () => Date.now(), maxSteps = MAX_STEPS, onSpend = () => {}, log = null }) {
+export async function runJob({ job, worker, model, toolbox, spendCapUsd, deadline, spentUsd = 0, now = () => Date.now(), maxSteps = MAX_STEPS, onSpend = () => {}, log = null, system: systemText = null, tools: withTools = true }) {
   const startedAt = now();
   const budgetMs = Math.max(1, deadline - startedAt);
   const wrapUpAt = deadline - Math.max(20_000, budgetMs * 0.15);
@@ -53,8 +54,10 @@ export async function runJob({ job, worker, model, toolbox, spendCapUsd, deadlin
   const signalFor = (ms) => AbortSignal.timeout(Math.max(1, Math.min(ms, timeLeft())));
 
   let tools = [];
-  try { tools = [...(await toolbox.defs(signalFor(15_000))), TIME_LEFT]; } catch (_) { tools = [TIME_LEFT]; }
-  const system = systemPrompt({ worker, job, deadline });
+  if (withTools) {
+    try { tools = [...(await toolbox.defs(signalFor(15_000))), TIME_LEFT]; } catch (_) { tools = [TIME_LEFT]; }
+  }
+  const system = systemText ?? systemPrompt({ worker, job, deadline });
   const history = [{ role: "user", text: job.task }];
   let wrapUp = false;
 

@@ -12,12 +12,17 @@
 //   POST /recipes/:key         the recipe's input: checked (a bad one is a 400, never a 402); unpaid -> 402 for the
 //                              recipe's price in USDG to the assigned worker (x402); paid -> settled, queued, 201
 //   GET  /jobs/:id             status, result, and the receipt (payer, amount, token, tx, worker, times, model spend)
+//   GET  /desks                the stock desks (src/stock-desk.mjs): each desk agent, its price, its caps, its tokens
+//   GET|POST /desks/:agentId/stock-brief   a Stock Token research brief by that agent, per call: unpaid -> 402 for
+//                              the price to that agent's wallet; paid -> verified, written, checked, then settled: 200
+//                              with the brief
 //
 // A job is assigned before it is priced (src/fleet.mjs), or to the worker it names (agentId), so the payment lands in
 // the wallet of the worker that does it. Paid jobs wait in one queue; each worker runs its own, one at a time, through `runner` (in-process in Node, a
 // JobRunner Durable Object per job in a Worker), which calls finish() with the outcome. Before anything is quoted, the
 // day's model budget must still hold a whole job (src/budget.mjs): when it does not, the request is refused with a
-// 503 and no 402 is ever issued.
+// 503 and no 402 is ever issued. A desk agent's jobs (its briefs, and its minutes) are held against its own day's
+// budget too (AGENT002_DESK_DAILY_CAP_USD), shared with no other agent.
 import { NETWORK, USDG, PRIORS, TOKENS, SOURCE, recordLink, isAddress, isTxHash } from "./chain.mjs";
 import { BadRequest, checkMinutes, checkTask, priceFor, formatAtomic, usd8 } from "./money.mjs";
 import { pickWorker, publicWorker } from "./fleet.mjs";
@@ -26,6 +31,8 @@ import { PaymentRefused, judgePriorsTransfer, readPriorsTransfer } from "./prior
 import { requirementFor, paymentRequired, encodeRequired, encodeSettlement, readPayment, quoteIdOf, sameRequirement, authorizationNonce } from "./x402.mjs";
 import { MCP_READ_TOOLS } from "./tools.mjs";
 import { RECIPES, recipeByKey, recipeView, checkInput } from "./recipes.mjs";
+import { DESK, refusal, tokenOf, tokensOf, pickToken, maxPromptChars, fitsCap, writeBrief } from "./stock-desk.mjs";
+import { makeModel } from "./model.mjs";
 import { mutex } from "./store.mjs";
 import { redact, safeMessage } from "./secrets.mjs";
 
@@ -74,14 +81,43 @@ const AUTHORIZATION_STATE = "0xe94a0102";
  *                                   worker; null when none does (no API key): that worker is not offered for USDG
  * @param {(method, params) => Promise<any>} o.rpc            Robinhood Chain JSON-RPC (src/rpc.mjs)
  * @param {boolean} [o.sandbox]      a local fork: record links go by wallet
+ * @param {object|null} [o.briefs]   the stock desks' brief source (src/stock-desk.mjs: status, brief, check); null: the
+ *                                   desks take no job
+ * @param {() => Promise<object>} [o.modelFor]  the model a brief is written on (src/model.mjs)
  */
-export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox = false, now = () => Date.now(), log = null, newId = randomId }) {
+export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox = false, now = () => Date.now(), log = null, newId = randomId, briefs = null, modelFor = () => makeModel(settings) }) {
   const lock = mutex();
   const workers = settings.workers;
   if (!workers.length) throw new Error("no workers: run `agent002 init`, or set AGENT002_WORKER_ADDRESS_1..3");
   const byId = new Map(workers.map((w) => [w.id, w]));
   const caps = { dailyCapUsd: settings.dailySpendCapUsd, jobCapUsd: settings.jobSpendCapUsd };
+  const desks = settings.desks || { agents: [], jobCapUsd: 0, dailyCapUsd: 0, maxSteps: 1, priceAtomic: 0n };
+  const deskIds = new Set(desks.agents);
+  const isDesk = (w) => !!w && w.agentId != null && deskIds.has(w.agentId);
   let lastPrune = 0;
+
+  // ---- model budgets: the deployment's for every job, and a desk agent's own for its jobs ------------------------
+
+  const agentLedger = (w) => `ledger:agent:${w.agentId}`;
+  /** The budgets a job of worker `w` is held against, each with its caps for a job of `jobCapUsd`. */
+  const ledgersOf = (w, jobCapUsd) => [
+    { key: "ledger", caps: { dailyCapUsd: caps.dailyCapUsd, jobCapUsd }, what: "the daily model budget" },
+    ...(isDesk(w) ? [{ key: agentLedger(w), caps: { dailyCapUsd: desks.dailyCapUsd, jobCapUsd }, what: `agent #${w.agentId}'s own daily model budget` }] : []),
+  ];
+  /** Throws DailyCapReached unless every budget of `w` still holds a whole job of `jobCapUsd`. */
+  async function checkLedgers(w, jobCapUsd) {
+    for (const l of ledgersOf(w, jobCapUsd)) checkCanTakeJob(await store.get(l.key), l.caps, now(), l.what);
+  }
+  /** Inside the lock: hold `jobCapUsd` for `jobId` in every budget of `w`, or in none (DailyCapReached). */
+  async function reserveLedgers(w, jobId, jobCapUsd) {
+    const next = [];
+    for (const l of ledgersOf(w, jobCapUsd)) next.push([l.key, reserve(await store.get(l.key), jobId, l.caps, now(), l.what)]);
+    for (const [k, v] of next) await store.put(k, v);
+  }
+  /** Inside the lock: `jobId`'s holds released, what it spent counted, in every budget of `w`. */
+  async function settleLedgers(w, jobId, spentUsd) {
+    for (const l of ledgersOf(w, 0)) await store.put(l.key, settleJob(await store.get(l.key), jobId, spentUsd, now()));
+  }
 
   const emptyFleet = () => ({ last: -1, workers: {} });
   const counters = (fleet, id) => (fleet.workers[id] ??= { active: 0, running: 0, done: 0, failed: 0, earned: { USDG: "0", PRIORS: "0" } });
@@ -126,7 +162,8 @@ export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox
           how: "POST /quote {minutes, payer} -> transfer the quoted amount of PRIORS to the quote's payTo -> POST /jobs {minutes, task, quote, payment: {token: \"PRIORS\", txHash}}",
         },
       ],
-      workers: workers.map((w) => {
+      // a desk-only worker sells briefs, no minutes: it is listed with its desk (`desks`), not here
+      workers: workers.filter((w) => !w.deskOnly).map((w) => {
         const c = counters(fleet, w.id);
         // a hire-only worker's entry leaves out its record link (the agent id gives it): a fleet of a few hundred stays
         // well under the 64 KB a board reads of a manifest
@@ -135,11 +172,85 @@ export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox
       model: { name: settings.model, jobSpendCapUsd: caps.jobCapUsd, dailySpendCapUsd: caps.dailyCapUsd, dailyLeftUsd: left, accepting: left + 1e-9 >= caps.jobCapUsd, ...(left + 1e-9 >= caps.jobCapUsd ? {} : { reopensAt: nextUtcDay(t) }) },
       tools: ["priors_check", ...MCP_READ_TOOLS, "time_left"],
       recipes: recipeList(),
-      endpoints: { manifest: "GET /manifest", quote: "POST /quote", hire: "POST /jobs", hireWorker: "POST /jobs {agentId, minutes, task}: that worker's time (POST /quote takes agentId too)", recipes: "GET /recipes", recipe: "POST /recipes/{key}", job: "GET /jobs/{id}" },
+      ...(deskIds.size ? { desks: await deskList() } : {}),
+      endpoints: { manifest: "GET /manifest", quote: "POST /quote", hire: "POST /jobs", hireWorker: "POST /jobs {agentId, minutes, task}: that worker's time (POST /quote takes agentId too)", recipes: "GET /recipes", recipe: "POST /recipes/{key}", job: "GET /jobs/{id}", ...(deskIds.size ? { desks: "GET /desks", desk: `GET or POST /desks/{agentId}/${DESK.key}?token={symbol}: a brief by that desk agent, per call` } : {}) },
     };
   }
 
   const recipeList = () => RECIPES.map((r) => recipeView(r, { jobSpendCapUsd: caps.jobCapUsd }));
+
+  // ---- the stock desks (src/stock-desk.mjs) ------------------------------------------------------------------------
+
+  const deskWorkers = () => desks.agents.map((id) => workers.find((w) => w.agentId === id));
+  /** A desk as the manifest and GET /desks show it: its agent, wallet, price, caps and whether it takes a job now. */
+  async function deskView(w) {
+    const left = availableUsd(await store.get(agentLedger(w)), desks.dailyCapUsd, now());
+    const accepting = !!briefs && left + 1e-9 >= desks.jobCapUsd;
+    const c = counters(await getFleet(), w.id); // the public counters: an internal payer's briefs are not in them
+    return {
+      agentId: w.agentId, wallet: w.address, product: DESK.key, title: DESK.title, jobsDone: c.done, earned: { USDG: formatAtomic(c.earned.USDG, USDG.decimals) },
+      price: { USDG: formatAtomic(desks.priceAtomic, USDG.decimals) }, priceAtomic: { USDG: desks.priceAtomic.toString() },
+      timeLimitMinutes: DESK.minutes, modelSpendCapUsd: desks.jobCapUsd, dailySpendCapUsd: desks.dailyCapUsd, dailyLeftUsd: left, maxSteps: desks.maxSteps,
+      accepting, ...(accepting || !briefs ? {} : { reopensAt: nextUtcDay(now()) }),
+      endpoint: `GET /desks/${w.agentId}/${DESK.key}?token={symbol}`,
+    };
+  }
+  const deskList = async () => Promise.all(deskWorkers().map(deskView));
+
+  /** GET /desks: every desk, with the tokens its source covers (and which are ready), and what a brief is. */
+  async function desksAnswer() {
+    const out = [];
+    for (const w of deskWorkers()) {
+      let tokens = null;
+      if (briefs) { try { tokens = tokensOf(await briefs.status({ agentId: w.agentId })); } catch (_) { tokens = null; } }
+      out.push({ ...(await deskView(w)), tokens });
+    }
+    return { product: { key: DESK.key, title: DESK.title, description: DESK.description, returns: DESK.returns, input: "token: the symbol of one of the desk's tokens, as ?token= or in a JSON body" }, desks: out };
+  }
+
+  /** The desk agent a path names (its agent id), or a 404. */
+  function deskOf(idText) {
+    const id = /^\d{1,12}$/.test(idText) ? Number(idText) : null;
+    const w = id !== null && deskIds.has(id) ? workers.find((x) => x.agentId === id) : null;
+    if (!w) throw Object.assign(new Error(`no stock desk here is agent #${String(idText).slice(0, 20)}: see GET /desks`), { status: 404, code: "unknown_desk" });
+    return w;
+  }
+
+  /**
+   * GET or POST /desks/<agentId>/stock-brief: everything checked before a 402 (the desk, the token, the source, the
+   * agent's caps); paid, the brief is written and checked between the payment's verification and its settlement
+   * (usdgPaid's `prepare`), so a refused brief is never charged.
+   */
+  async function deskSale(request, url, idText) {
+    const body = request.method === "POST" ? await readBody(request) : {};
+    const w = deskOf(idText);
+    if (body.payment !== undefined) throw new BadRequest("a brief is paid in USDG over x402: send the request without payment for a 402", "bad_payment");
+    for (const k of Object.keys(body)) if (k !== "token") throw new BadRequest(`${k} is not an input of the brief (it takes: token)`, "bad_input");
+    const symbol = tokenOf(url.searchParams.get("token") ?? body.token);
+    if (!briefs) throw Object.assign(new Error("the stock desk has no brief source here: it takes no job"), { status: 503, code: "desk_unavailable" });
+    let tokens;
+    try { tokens = tokensOf(await briefs.status({ agentId: w.agentId })); } catch (e) {
+      throw Object.assign(new Error(`the brief source did not answer (${safeMessage(e)}): nothing was asked to be paid`), { status: 503, code: "desk_unavailable" });
+    }
+    const token = symbol ? pickToken(tokens, symbol) : null;
+    if (token ? !token.ready : !tokens.some((t) => t.ready)) throw Object.assign(new Error(`agent #${w.agentId} has no fresh brief on ${token ? token.symbol : "any of its tokens"} just now: try again later (nothing was asked to be paid)`), { status: 503, code: "brief_unavailable" });
+    const model = await modelFor();
+    if (!fitsCap(model, desks.jobCapUsd, maxPromptChars(w))) throw refusal(422, "job_cap", `a brief would cost more than agent #${w.agentId}'s model cap of $${desks.jobCapUsd} a job: it takes no job (nothing was asked to be paid)`);
+    const order = {
+      minutes: DESK.minutes, task: `${DESK.title}${token ? ` on ${token.symbol}` : ""} by desk agent #${w.agentId}`, taskHash: await sha256Hex(`desk ${DESK.key} #${w.agentId}`),
+      amount: desks.priceAtomic, recipe: null, desk: DESK.key, agentId: w.agentId, input: token ? { token: token.symbol } : {},
+      spendCapUsd: desks.jobCapUsd, jobCapUsd: desks.jobCapUsd,
+      prepare: ({ jobId }) => writeBrief({ briefs, model, worker: w, token, jobId, jobCapUsd: desks.jobCapUsd, maxSteps: desks.maxSteps, now, log }),
+    };
+    const payment = readPayment(request);
+    if (payment) {
+      if (!token) throw new BadRequest(`name the token to pay for: ?token=<symbol> (${tokens.map((t) => t.symbol).join(", ")}); nothing was charged`, "bad_input");
+      return usdgPaid(payment, order);
+    }
+    const base = settings.publicUrl ? settings.publicUrl.replace(/\/+$/, "") : url.origin;
+    const resource = `${base}/desks/${w.agentId}/${DESK.key}${token ? `?token=${encodeURIComponent(token.symbol)}` : ""}`;
+    return usdgQuote(order, resource, (wk, amount) => `one ${DESK.title} (a fixed price) ${token ? `on ${token.symbol}` : "on the token the paid call names (?token=<symbol>)"} by desk agent #${wk.agentId}: ${amount} USDG to ${wk.address}`);
+  }
 
   // ---- quotes ----------------------------------------------------------------------------------------------------
 
@@ -147,15 +258,17 @@ export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox
    * Assign a worker and record a quote, inside the lock. Refuses (503) when the day's model budget is spent, and when
    * no worker can take this payment (`eligible`: for USDG, a worker the facilitator settles for). `agentId`: the worker
    * the request names (404 when none here is that agent); null: the least-loaded of the workers that are not hire-only.
+   * `jobCapUsd`: what the job may spend on the model, held against the budgets once paid (a desk agent's own too).
    */
-  async function newQuote(fields, eligible = () => true, agentId = null) {
+  async function newQuote(fields, eligible = () => true, agentId = null, jobCapUsd = caps.jobCapUsd, desk = false) {
     return lock(async () => {
-      checkCanTakeJob(await store.get("ledger"), caps, now()); // throws DailyCapReached: no quote, no 402
+      checkCanTakeJob(await store.get("ledger"), { ...caps, jobCapUsd }, now()); // throws DailyCapReached: no quote, no 402
       const fleet = await getFleet();
       let i;
       if (agentId !== null) {
         i = workers.findIndex((w) => w.agentId === agentId);
         if (i < 0) throw Object.assign(new Error(`no worker here is agent #${agentId}: see GET /manifest`), { status: 404, code: "unknown_worker" });
+        if (workers[i].deskOnly && !desk) throw Object.assign(new Error(`agent #${agentId} sells research briefs here, not minutes: see GET /desks`), { status: 404, code: "desk_only" });
         if (!eligible(workers[i])) throw Object.assign(new Error(`agent #${agentId} cannot be paid this way here (no facilitator API key for it): pay in PRIORS (POST /quote)`), { status: 503, code: "usdg_unavailable" });
       } else {
         const anyPool = workers.some((w) => !w.hireOnly);
@@ -165,6 +278,7 @@ export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox
         fleet.last = i;
       }
       const w = workers[i];
+      if (isDesk(w)) await checkLedgers(w, jobCapUsd); // a desk agent's own day: no quote, no 402 once it is spent
       const t = now();
       const quote = { id: newId("q"), workerId: w.id, payTo: w.address, createdAt: t, status: "open", ...fields(t) };
       await store.put("fleet", fleet);
@@ -253,10 +367,10 @@ export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox
 
   /** Unpaid: assign a worker and answer 402 with the requirement for the order's amount of USDG to its wallet. */
   async function usdgQuote(order, resource, describe) {
-    const { minutes, taskHash, recipe } = order;
+    const { minutes, taskHash, recipe, desk = null } = order;
     const amount = formatAtomic(order.amount, USDG.decimals);
     await prune();
-    const { quote, worker } = await newQuote((t) => ({ method: "x402", token: "USDG", minutes, amount: order.amount.toString(), taskHash, ...(recipe ? { recipe } : {}), expiresAt: t + settings.x402QuoteSeconds * 1000 }), (w) => !!facilitatorFor(w), order.agentId ?? null);
+    const { quote, worker } = await newQuote((t) => ({ method: "x402", token: "USDG", minutes, amount: order.amount.toString(), taskHash, ...(recipe ? { recipe } : {}), ...(desk ? { desk } : {}), expiresAt: t + settings.x402QuoteSeconds * 1000 }), (w) => !!facilitatorFor(w), order.agentId ?? null, order.jobCapUsd ?? caps.jobCapUsd, !!desk);
     const requirement = requirementFor(quote, { maxTimeoutSeconds: settings.x402QuoteSeconds });
     const pr = paymentRequired({
       requirement,
@@ -264,11 +378,15 @@ export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox
       description: describe(worker, amount),
       error: "PAYMENT-SIGNATURE header is required",
     });
-    log?.info?.(`quote ${quote.id}: 402 for ${recipe ? `recipe ${recipe}` : `${minutes} min`}, ${amount} USDG to ${worker.id}`);
-    return json(402, { ...pr, quote: { id: quote.id, worker: publicWorker(worker), ...(recipe ? { recipe } : {}), minutes, amount, token: "USDG", expiresAt: new Date(quote.expiresAt).toISOString() } }, { "payment-required": encodeRequired(pr) });
+    log?.info?.(`quote ${quote.id}: 402 for ${recipe ? `recipe ${recipe}` : desk ? `desk ${desk}` : `${minutes} min`}, ${amount} USDG to ${worker.id}`);
+    return json(402, { ...pr, quote: { id: quote.id, worker: publicWorker(worker), ...(recipe ? { recipe } : {}), ...(desk ? { desk, input: order.input } : {}), minutes, amount, token: "USDG", expiresAt: new Date(quote.expiresAt).toISOString() } }, { "payment-required": encodeRequired(pr) });
   }
 
-  /** Paid: check the payment against the quote it names, reserve the job's model budget, verify, settle, queue. */
+  /**
+   * Paid: check the payment against the quote it names, reserve the job's model budget, verify, settle, queue. An order
+   * with `prepare` (a desk's brief) is done between verification and settlement: a refusal there reopens the quote and
+   * settles nothing; settled, the job is done at once and its result is the answer (200).
+   */
   async function usdgPaid(payment, order) {
     const { minutes, task, taskHash } = order;
     const qid = quoteIdOf(payment);
@@ -283,13 +401,13 @@ export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox
       }
       if (quote.status === "settling") throw new PaymentRefused("settling", "this payment is being settled: send the same request again in a few seconds", { status: 409, retry: true });
       if (quote.status === "unsettled" && quote.nonce !== nonce) throw new PaymentRefused("unsettled", "this quote has a payment whose settlement is unconfirmed: send that same payment again to reconcile it", { status: 409 });
-      if (quote.minutes !== minutes || quote.taskHash !== taskHash || (quote.recipe ?? null) !== order.recipe) throw new BadRequest("this payment's quote was for another job (other minutes, task, recipe or input): send this job unpaid for its own 402", "quote_mismatch");
+      if (quote.minutes !== minutes || quote.taskHash !== taskHash || (quote.recipe ?? null) !== order.recipe || (quote.desk ?? null) !== (order.desk ?? null)) throw new BadRequest("this payment's quote was for another job (other minutes, task, recipe, desk or input): send this job unpaid for its own 402", "quote_mismatch");
       if (order.agentId != null && byId.get(quote.workerId)?.agentId !== order.agentId) throw new BadRequest("this payment's quote was for another worker than the agentId named: send this job unpaid for its own 402", "quote_mismatch");
       const requirement = requirementFor(quote, { maxTimeoutSeconds: settings.x402QuoteSeconds });
       if (!sameRequirement(payment.accepted, requirement)) throw new PaymentRefused("requirement_mismatch", "the payment does not accept the requirement this quote issued (amount, asset, network or payTo differ)");
       if (quote.status === "open" && quote.expiresAt < now()) throw new PaymentRefused("quote_expired", "this quote expired: send the request without payment for a fresh 402");
       const jobId = quote.jobId || newId("job");
-      await store.put("ledger", reserve(await store.get("ledger"), jobId, caps, now())); // throws DailyCapReached: nothing settled
+      await reserveLedgers(byId.get(quote.workerId), jobId, order.jobCapUsd ?? caps.jobCapUsd); // throws DailyCapReached: nothing settled
       const reconcile = quote.status === "unsettled";
       Object.assign(quote, { status: "settling", jobId, nonce });
       await store.put(`quote:${quote.id}`, quote);
@@ -307,6 +425,9 @@ export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox
       throw Object.assign(new Error(`worker ${worker.id} cannot settle USDG here (no facilitator API key): nothing was charged`), { status: 503, code: "usdg_unavailable" });
     }
     let settlement = null, payer = null;
+    // a desk's brief written before an earlier settlement whose outcome was unknown: delivered, not written again
+    let prepared = quote.prepared ?? null;
+    const uncounted = () => (prepared && !prepared.counted ? prepared.spentUsd || 0 : 0);
 
     // a settlement whose outcome was unknown: if the authorization was used on chain, the payment landed
     if (claim.reconcile && (await authorizationUsed(payment))) {
@@ -325,18 +446,33 @@ export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox
         throw new PaymentRefused("invalid_payment", `the facilitator refused the payment: ${v?.invalidReason || "invalid"}${v?.invalidMessage ? ` (${String(v.invalidMessage).slice(0, 200)})` : ""}`);
       }
       payer = v.payer || null;
+      // a desk's brief: written and checked now, between the verification and the settlement. A refusal settles nothing
+      if (order.prepare && !prepared) {
+        try { prepared = await order.prepare({ jobId, worker }); } catch (e) {
+          await reopen(quote, jobId, "open", e?.spentUsd ?? 0);
+          if (typeof e?.code === "string" && Number.isInteger(e?.status)) throw e;
+          throw refusal(502, "brief_failed", `the brief could not be written (${safeMessage(e)}): nothing was charged`);
+        }
+      }
       try {
         settlement = await facilitator.settle(payment, requirement);
       } catch (e) {
         // the outcome is unknown: the authorization may have been cashed. The quote waits for the same payment again,
         // which is then reconciled against the chain (authorizationState) before anything is settled twice.
-        await reopen(quote, jobId, "unsettled");
+        await reopen(quote, jobId, "unsettled", uncounted(), prepared);
         throw Object.assign(new Error(`the facilitator did not confirm the settlement (${safeMessage(e)}): send the same paid request again to reconcile it`), { status: 502, code: "settlement_unknown" });
       }
       if (!settlement?.success) {
-        await reopen(quote, jobId, "open");
+        await reopen(quote, jobId, "open", uncounted());
         throw new PaymentRefused("settle_failed", `the payment did not settle: ${settlement?.errorReason || "failed"}`);
       }
+    }
+    if (order.prepare) {
+      // paid: the brief is the answer. (Reconciled with no brief kept, it is written now: the buyer has paid for it.)
+      if (!prepared) {
+        try { prepared = await order.prepare({ jobId, worker }); } catch (e) { prepared = { failed: safeMessage(e), spentUsd: e?.spentUsd ?? 0 }; }
+      }
+      return deskDone({ order, quote, jobId, worker, settlement, payer, prepared });
     }
     const job = await lock(async () => {
       const t = now();
@@ -356,12 +492,51 @@ export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox
     return json(201, jobView(job), { "payment-response": encodeSettlement({ success: true, transaction: job.payment.txHash || "", network: job.payment.network, payer: job.payment.payer }) });
   }
 
-  async function reopen(quote, jobId, status) {
+  /** The quote back to `status`, the job's holds released and `spentUsd` (what a brief spent) counted. An unsettled
+   *  quote keeps the brief `prepared` for it, its spend counted once. */
+  async function reopen(quote, jobId, status, spentUsd = 0, prepared = null) {
     await lock(async () => {
       const q = await store.get(`quote:${quote.id}`);
-      if (q) { q.status = status; if (status === "open") { delete q.jobId; delete q.nonce; } await store.put(`quote:${q.id}`, q); }
-      await store.put("ledger", settleJob(await store.get("ledger"), jobId, 0, now()));
+      if (q) {
+        q.status = status;
+        if (status === "open") { delete q.jobId; delete q.nonce; delete q.prepared; } else if (prepared) q.prepared = { ...prepared, counted: true };
+        await store.put(`quote:${q.id}`, q);
+      }
+      await settleLedgers(byId.get(quote.workerId), jobId, spentUsd);
     });
+  }
+
+  /** A desk's brief, paid: the job is done at once (or failed, if a reconciled payment's brief could not be written),
+   *  counted against its agent like any job, and answered with its result (200). */
+  async function deskDone({ order, quote, jobId, worker, settlement, payer, prepared }) {
+    const job = await lock(async () => {
+      const t = now();
+      const ok = !prepared.failed;
+      const j = {
+        id: jobId, status: ok ? "done" : "failed", workerId: worker.id, minutes: order.minutes, task: order.task,
+        desk: order.desk, input: order.input, spendCapUsd: order.spendCapUsd,
+        result: ok ? prepared.result : null, error: ok ? null : prepared.failed, summary: ok ? prepared.summary : null, brief: ok ? prepared.brief : null,
+        quoteId: quote.id, createdAt: t, modelSpendUsd: usd8(prepared.spentUsd || 0), model: prepared.model ?? settings.model, steps: prepared.steps ?? 0, toolCalls: 0, stoppedBy: null,
+        startedAt: prepared.startedAt ?? new Date(t).toISOString(), finishedAt: prepared.finishedAt ?? new Date(t).toISOString(),
+        payment: { method: "x402", token: "USDG", tokenAddress: USDG.address, amount: quote.amount, payer: settlement.payer || payer, txHash: settlement.transaction || null, network: settlement.network || NETWORK, paidAt: t, ...(settlement.reconciled ? { note: "reconciled from the chain: the settlement's transaction hash was not reported" } : {}) },
+      };
+      // the public counters, or the internal ones for a brief an internal payer bought (as finish() counts a job)
+      if (isInternal(j.payment.payer)) j.internal = true;
+      const fleet = await getFleet();
+      const c = counters(fleet, worker.id);
+      const k = j.internal ? internalOf(c) : c;
+      if (ok) k.done++; else k.failed++;
+      k.earned.USDG = (BigInt(k.earned.USDG || "0") + BigInt(j.payment.amount)).toString();
+      await store.put(`job:${j.id}`, j);
+      await settleLedgers(worker, jobId, prepared.counted ? 0 : prepared.spentUsd || 0);
+      Object.assign(quote, { status: "used" });
+      delete quote.prepared;
+      await store.put(`quote:${quote.id}`, quote);
+      await store.put("fleet", fleet);
+      return j;
+    });
+    log?.info?.(`job ${job.id}: ${order.desk} by ${worker.id}, paid ${formatAtomic(job.payment.amount, USDG.decimals)} USDG (tx ${job.payment.txHash}), ${job.status}, model spend $${job.modelSpendUsd}`);
+    return json(200, jobView(job), { "payment-response": encodeSettlement({ success: true, transaction: job.payment.txHash || "", network: job.payment.network, payer: job.payment.payer }) });
   }
 
   async function authorizationUsed(payment) {
@@ -406,8 +581,7 @@ export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox
       const q = await store.get(`quote:${qid}`);
       if (!q || q.status !== "open") throw new PaymentRefused("quote_used", "this quote was already paid for", { status: 409 });
       const jobId = newId("job");
-      let ledger;
-      try { ledger = reserve(await store.get("ledger"), jobId, caps, now()); } catch (e) {
+      try { await reserveLedgers(byId.get(q.workerId), jobId, caps.jobCapUsd); } catch (e) {
         if (e instanceof DailyCapReached) throw new DailyCapReached(`${e.message.replace(/, nothing was charged$/, "")}. Your payment is valid and was not used: claim it again with the same request after ${nextUtcDay(now())} (until ${new Date(q.claimUntil).toISOString()})`);
         throw e;
       }
@@ -416,7 +590,6 @@ export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox
         id: jobId, status: "queued", workerId: q.workerId, minutes, task, quoteId: q.id, createdAt: t, modelSpendUsd: 0,
         payment: { method: "transfer", token: "PRIORS", tokenAddress: PRIORS.address, amount: paid.amount.toString(), payer: paid.payer, txHash, network: NETWORK, blockNumber: paid.blockNumber, confirmations: paid.confirmations, paidAt: t },
       };
-      await store.put("ledger", ledger);
       await store.put(`used:${txHash}`, { jobId, quoteId: q.id, at: t });
       Object.assign(q, { status: "used", jobId, txHash });
       await store.put(`quote:${q.id}`, q);
@@ -512,7 +685,7 @@ export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox
         finishedAt: outcome.finishedAt ?? new Date(now()).toISOString(),
       });
       await store.put(`job:${jobId}`, j);
-      await store.put("ledger", settleJob(await store.get("ledger"), jobId, j.modelSpendUsd, now()));
+      await settleLedgers(byId.get(j.workerId), jobId, j.modelSpendUsd);
       const fleet = await getFleet();
       const c = counters(fleet, j.workerId);
       c.active = Math.max(0, c.active - 1);
@@ -559,6 +732,7 @@ export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox
       id: j.id,
       status: j.status,
       ...(j.recipe ? { recipe: { key: j.recipe, title: recipeByKey(j.recipe)?.title ?? j.recipe }, input: j.input ?? null } : {}),
+      ...(j.desk ? { desk: { key: j.desk, title: DESK.title }, input: j.input ?? null, summary: j.summary ?? null, brief: j.brief ?? null } : {}),
       minutes: j.minutes,
       task: j.task,
       worker: publicWorker(w),
@@ -580,12 +754,12 @@ export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox
         paidAt: new Date(j.payment.paidAt).toISOString(),
         startedAt: j.startedAt ?? null,
         finishedAt: j.finishedAt ?? null,
-        minutesBought: j.recipe ? null : j.minutes, // a recipe is bought at a fixed price, not by the minute
+        minutesBought: j.recipe || j.desk ? null : j.minutes, // a recipe or a brief is bought at a fixed price, not by the minute
         timeLimitMinutes: j.minutes,
         minutesUsed: started !== null && finished !== null ? Math.round(((finished - started) / 60_000) * 100) / 100 : null,
         secondsUsed: started !== null && finished !== null ? Math.round((finished - started) / 100) / 10 : null,
         modelSpendUsd: j.modelSpendUsd ?? 0,
-        ...(j.recipe ? { modelSpendCapUsd: j.spendCapUsd } : {}),
+        ...(j.recipe || j.desk ? { modelSpendCapUsd: j.spendCapUsd } : {}),
         model: j.model ?? settings.model,
         steps: j.steps ?? null,
         toolCalls: j.toolCalls ?? null,
@@ -626,6 +800,9 @@ export function makeDesk({ settings, store, runner, facilitatorFor, rpc, sandbox
       if (path === "/quote" && (request.method === "POST" || request.method === "GET")) return await priorsQuote(request, url);
       if (path === "/jobs" && request.method === "POST") return await postJob(request, url);
       if (path === "/recipes" && request.method === "GET") return json(200, { recipes: recipeList() });
+      if (path === "/desks" && request.method === "GET") return json(200, await desksAnswer());
+      const d = new RegExp(`^/desks/([^/]+)/${DESK.key}$`).exec(path);
+      if (d && (request.method === "GET" || request.method === "POST")) return await deskSale(request, url, d[1]);
       const r = /^\/recipes\/([^/]+)$/.exec(path);
       if (r && request.method === "POST") return await postRecipe(request, url, r[1]);
       if (r && request.method === "GET") {

@@ -5,6 +5,8 @@
 //                                                         or all at once: agent002 wrangler-secrets, then wrangler secret bulk)
 // Optional secret: AGENT002_RPC (a private Robinhood Chain node; the public one is the default).
 // No secret goes in this file.
+// Stock desks (optional, src/stock-desk.mjs): "AGENT002_STOCK_DESKS" in vars below, and their brief source as a service
+// binding, e.g. "services": [{ "binding": "STOCK_BRIEFS", "service": "<the brief source's Worker>", "entrypoint": "<its entrypoint>" }]
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "agent002",

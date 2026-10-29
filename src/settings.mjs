@@ -30,6 +30,17 @@
 //                                  _3... A job one of them pays is quoted, paid, settled and run as any other; the manifest's
 //                                  public counters (a worker's jobsDone, jobsActive, earned) leave it out, so the operator's
 //                                  own use never reads as demand. Set it in the deployment's variables; nothing answers it
+//   AGENT002_STOCK_DESKS           the agents that sell a Stock Token research brief per call (src/stock-desk.mjs), each
+//                                  paid at its own wallet: "agentId" for one of the workers above (numbered or hire-only),
+//                                  or "agentId:wallet" for a desk-only worker (its registry wallet), one that sells briefs
+//                                  and no minutes; comma-separated. Their briefs come from the brief source (a Worker's
+//                                  STOCK_BRIEFS binding); desk-only workers settle with AGENT002_HIRE_FACILITATOR_KEY
+//   AGENT002_DESK_PRICE_USDG       the brief's price, USDG a call (default 0.05; at most 0.10)
+//   AGENT002_DESK_JOB_CAP_USD      most one brief may spend on the model (default 0.02; at most half the price, and at most
+//                                  AGENT002_JOB_SPEND_CAP_USD)
+//   AGENT002_DESK_DAILY_CAP_USD    most one desk agent's jobs may spend on the model in a UTC day, its own budget, shared
+//                                  with no other agent (default 0.50): every job it runs, briefs and minutes alike
+//   AGENT002_DESK_MAX_STEPS        model calls one brief may make at most (default 2, from 1 to 12)
 //   OPENROUTER_API_KEY             secret: the model provider's key
 import { computeAddress, getAddress } from "ethers";
 import { PUBLIC_RPC, USDG, PRIORS, isAddress } from "./chain.mjs";
@@ -134,6 +145,47 @@ export function internalPayersFromEnv(env) {
   return out;
 }
 
+/** How many agents AGENT002_STOCK_DESKS may name. */
+export const MAX_DESKS = 10;
+/** The most a desk's brief may cost a buyer, as a recipe (src/recipes.mjs): 0.10 USDG. */
+export const MAX_DESK_PRICE_ATOMIC = 100_000n;
+
+/**
+ * The stock desks (AGENT002_STOCK_DESKS and its caps), against the workers already read: { agents: [agentId...],
+ * workers: [the desk-only workers it adds], priceUsdg, priceAtomic, jobCapUsd, dailyCapUsd, maxSteps }. An id with no
+ * wallet that is no worker here, or a wallet that is not that worker's, stops the service.
+ */
+export function desksFromEnv(env, workers, { jobSpendCapUsd }) {
+  const raw = str(env, "AGENT002_STOCK_DESKS", null);
+  const agents = [], added = [];
+  for (const item of (raw || "").split(",").map((x) => x.trim()).filter(Boolean)) {
+    const m = /^(\d{1,12})(?::(0x[0-9a-fA-F]{40}))?$/.exec(item);
+    if (!m) throw new Error(`AGENT002_STOCK_DESKS: ${JSON.stringify(item.slice(0, 60))} is not agentId or agentId:wallet`);
+    const id = Number(m[1]);
+    if (agents.includes(id)) throw new Error(`AGENT002_STOCK_DESKS names agent #${id} twice`);
+    const w = workers.find((x) => x.agentId === id);
+    if (!w && !m[2]) throw new Error(`AGENT002_STOCK_DESKS: agent #${id} is not one of the workers (AGENT002_WORKER_AGENT_ID_<n> or AGENT002_HIRE_WORKERS): name its wallet (${id}:0x...) for a desk-only worker`);
+    if (w && m[2] && w.address.toLowerCase() !== m[2].toLowerCase()) throw new Error(`AGENT002_STOCK_DESKS: agent #${id} is a worker here with another wallet than ${m[2]}`);
+    if (!w) added.push({ id: `d${id}`, n: null, agentId: id, address: getAddress(m[2]), hireOnly: true, deskOnly: true });
+    agents.push(id);
+  }
+  if (agents.length > MAX_DESKS) throw new Error(`AGENT002_STOCK_DESKS names ${agents.length} agents; at most ${MAX_DESKS}`);
+  const priceUsdg = str(env, "AGENT002_DESK_PRICE_USDG", "0.05");
+  const priceAtomic = toAtomic(priceUsdg, USDG.decimals, "AGENT002_DESK_PRICE_USDG");
+  if (priceAtomic <= 0n || priceAtomic > MAX_DESK_PRICE_ATOMIC) throw new Error("AGENT002_DESK_PRICE_USDG must be above 0 and at most 0.10");
+  // the default job cap: 0.02, or less when half the price or the per-job cap is less
+  const jobCapUsd = num(env, "AGENT002_DESK_JOB_CAP_USD", Math.min(0.02, Number(priceUsdg) / 2, jobSpendCapUsd), { min: 0, gt: true });
+  const dailyCapUsd = num(env, "AGENT002_DESK_DAILY_CAP_USD", 0.5, { min: 0, gt: true });
+  const maxSteps = num(env, "AGENT002_DESK_MAX_STEPS", 2, { integer: true, min: 1 });
+  if (maxSteps > 12) throw new Error("AGENT002_DESK_MAX_STEPS must be from 1 to 12");
+  if (agents.length) {
+    if (jobCapUsd > Number(priceUsdg) / 2) throw new Error("AGENT002_DESK_JOB_CAP_USD cannot be above half of AGENT002_DESK_PRICE_USDG");
+    if (jobCapUsd > jobSpendCapUsd) throw new Error("AGENT002_DESK_JOB_CAP_USD cannot be above AGENT002_JOB_SPEND_CAP_USD");
+    if (jobCapUsd > dailyCapUsd) throw new Error("AGENT002_DESK_JOB_CAP_USD cannot be above AGENT002_DESK_DAILY_CAP_USD");
+  }
+  return { agents, workers: added, priceUsdg, priceAtomic, jobCapUsd, dailyCapUsd, maxSteps };
+}
+
 /** AGENT002_FACILITATOR_KEY_<n>, by worker id; registered as secrets. */
 export function facilitatorKeysFromEnv(env) {
   const keys = {};
@@ -186,8 +238,11 @@ export function settingsFromEnv(env = {}, { workers: baseWorkers = null } = {}) 
   const fromEnv = workersFromEnv(env);
   const byId = new Map((baseWorkers || []).map((w) => [w.id, w]));
   for (const w of fromEnv) byId.set(w.id, { ...byId.get(w.id), ...w });
-  // the numbered workers first (w1, w2, ...), then the hire-only ones in the order the variables list them
+  // the numbered workers first (w1, w2, ...), then the hire-only ones in the order the variables list them, then the
+  // desk-only ones (AGENT002_STOCK_DESKS's agentId:wallet items)
   s.workers = [...[...byId.values()].sort((a, b) => a.id.localeCompare(b.id, "en", { numeric: true })), ...hireWorkersFromEnv(env)];
+  s.desks = desksFromEnv(env, s.workers, s);
+  s.workers.push(...s.desks.workers);
   const seen = new Set(), ids = new Set();
   for (const w of s.workers) {
     const a = w.address.toLowerCase();
