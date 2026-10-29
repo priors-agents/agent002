@@ -221,6 +221,24 @@ test("a paid brief: verified, written from the source's facts by the agent's mod
   assert.equal(m.model.dailyLeftUsd, 2.999, "and so does the deployment's");
 });
 
+test("what a desk answers names no operator and links nothing but the service itself and the brief's own sources: GET /desks, the 402 and its description, the paid brief, its receipt, the summary's prompt", async () => {
+  const s = deskSetup({ AGENT002_PUBLIC_URL: "https://agent002.example" });
+  const r402 = await s.call("GET", path(IDS[0], "TSLA"));
+  const { paid, body } = await buy(s.call, ethers.Wallet.createRandom(), IDS[0]);
+  assert.equal(paid.status, 200);
+  const brief = await fakeBriefs().brief({ agentId: IDS[0], token: "TSLA" });
+  const own = (u) => u.startsWith("https://agent002.example/") || brief.markdown.includes(u);
+  const texts = [
+    JSON.stringify(await (await s.call("GET", "/desks")).json()), JSON.stringify((await (await s.call("GET", "/manifest")).json()).desks),
+    await r402.text(), Buffer.from(r402.headers.get("payment-required"), "base64").toString(), JSON.stringify(body),
+    s.model.seen[0].system, JSON.stringify(DESK),
+  ];
+  for (const t of texts) {
+    assert.doesNotMatch(t, /operat/i, "no operator named");
+    for (const u of t.match(/https?:\/\/[^\s"'<>)\]\\]+/g) || []) assert.ok(own(u), `a link that is neither the service's nor the brief's source: ${u}`);
+  }
+});
+
 test("a long brief reaches the model whole (up to the brief's bound), not cut at a tool result's size", async () => {
   const long = `## What moved\n${"- a fact with its source (https://news.example/a)\n".repeat(200)}`;
   assert.ok(long.length > 6000 && long.length <= DESK.maxBriefChars);
