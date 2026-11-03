@@ -31,8 +31,9 @@ const LATE = "Priors gives 3 days of grace after a due date before a loan can be
 
 const SCORE_FACTS = [
   "How the two Priors scores are built (apply these facts; do not contradict them):",
-  "- The on-chain score (v1: `onchainScore` in the check, \"Score N/1000\" in agent_record), the one the contracts use: 1 point per 10 USDG-days repaid (principal x days held, up to 400); 20 per qualified loan, a loan held 7 days or more and repaid (up to 200); 1 per 5 USDG of backing at risk behind the agent (up to 150); 2 per day since it enrolled (up to 150); 50 per debt of a vouched agent it paid (up to 100); minus 75 per vouched agent that defaulted; 0 after its own default.",
+  "- The pool score (v1: `record.onchainScore` in the check, \"Score N/1000\" in agent_record), the one the pool's contracts compute: 1 point per 10 USDG-days repaid (principal x days held, up to 400); 20 per qualified loan, a loan held 7 days or more and repaid (up to 200); 1 per 5 USDG of backing at risk behind the agent (up to 150); 2 per day since it enrolled (up to 150); 50 per debt of a vouched agent it paid (up to 100); minus 75 per vouched agent that defaulted; 0 after its own default.",
   "- Priors Score v2 (`scoreV2` in the check), the one priors.trade shows: risk time (up to 300: 1 point per 10 USDG-days that someone else put at risk, on loans repaid on time); seasoned loans (up to 200: loans held 7+ days, repaid on time and backed by someone else, 20 each for 50 USDG or more, a 5 USDG loan 2); backing (up to 150: 1 point per 5 USDG another party has at risk behind it now); age (up to 100: days since its first loan); recourse (up to 100: 50 per vouched agent's debt it paid); income (up to 150: x402 USDG paid to its payment wallet over the last 30 days by payers that are not its own, a payer counting from 1 USDG and capped at 20 USDG, plus 5 points per payer up to 50); minus 10 per late repayment (repaid in the grace period, which earns nothing); minus 75 per vouched agent that defaulted; 0 after a default.",
+  "- The attested score (`attestedScore` in the check): the Priors Score v2 entry the attester last posted to the ERC-8004 reputation registry, the one score-gated pools read. It follows Priors Score v2 on the attester's rules (a move of 25 points, a rung, a new weights version), so the two can differ for a while; null means the registry holds no Priors score for the agent.",
   "- \"Backed by someone else\": the loan's backer is another owner's agent that had been on Priors for 30+ days when the loan was issued (the protocol's treasury and seat vault count from day one). Backing from the agent's own owner earns no v2 risk time and no seasoned loans.",
   "- v2 rungs: 0 unproven; 1 started (one repayment backed by someone else); 2 proven (3+ such repayments over 14+ days, none late); 3 earned (proven, a record score of 300+ without income, 30+ days since the first backed loan); 4 income-backed (earned, and income of 50+ points from 3+ payers of 1 USDG or more). The check's `scoreV2.next` gives what the next rung needs (have / need), and `blocked` when a late repayment keeps it closed.",
 ].join("\n");
@@ -64,7 +65,7 @@ const DEFS = [
     key: "watch-agents",
     title: "Watch agents",
     description: "A watch on a list of Priors agents: late or defaulted loans, freezes, and each agent's score against the one you last saw.",
-    returns: "Markdown: the alerts (a default, a freeze, a loan past due), one row per agent (verdict, open loans, late or defaulted, both scores, the change since your last-seen score), and the scores now as one JSON line to pass as lastScores next time.",
+    returns: "Markdown: the alerts (a default, a freeze, a loan past due), one row per agent (verdict, open loans, late or defaulted, the pool score, the attested score score-gated pools read, Priors Score v2, the change since your last-seen score), and the scores now as one JSON line to pass as lastScores next time.",
     price: "0.06",
     minutes: 3,
     input: {
@@ -92,7 +93,7 @@ const DEFS = [
         `3. ${LATE}`,
         "4. Write in Markdown:",
         "## Alerts: every agent with a default, a freeze, or an open loan past its due date at the snapshot time; or \"none\".",
-        "## Agents: a table, one row per agent in the order given: agent, name, check verdict, open loans (the earliest due date), late or defaulted, on-chain score, Priors Score v2 (rung), change since last seen (\"n/a\" when the buyer gave no last-seen score for it).",
+        "## Agents: a table, one row per agent in the order given: agent, name, check verdict, open loans (the earliest due date), late or defaulted, pool score (`record.onchainScore`), attested score (`attestedScore.score` and its `version`: the entry score-gated pools read on the ERC-8004 registry; \"none\" when it is null, \"n/a\" when the check has no `attestedScore`), Priors Score v2 (rung), change since last seen (\"n/a\" when the buyer gave no last-seen score for it).",
         "## Scores now: one line of JSON with each agent's Priors Score v2 by id, e.g. {\"437\": 120}, for the buyer to send as lastScores next time.",
       ].join("\n");
     },
@@ -116,7 +117,7 @@ const DEFS = [
       "## Line and backing: who backs it, its line, drawn and available; its stock line, if any.",
       "## Record: loans repaid (and how many qualified), USDG repaid, fees paid, late repayments, defaulted or frozen.",
       "## Open loans: each with its amount, fee and due date, and whether it is past due at the snapshot time.",
-      "## Scores: the on-chain score, and Priors Score v2 with its rung and what the next rung needs.",
+      "## Scores: the pool score (`record.onchainScore`), the attested score score-gated pools read (`attestedScore`, with its weights version; \"none\" when null), and Priors Score v2 with its rung and what the next rung needs.",
       "## Owner: the owner wallet's Ethos score, if the check gives it.",
       "## Flags: what a counterparty should know (a default, a freeze, a loan past due, a late repayment, a thin record, backing only from its own owner), or \"none found\".",
       "## Sources: the tools used and the snapshot time.",
@@ -167,9 +168,9 @@ const DEFS = [
       `1. In one step, call priors_check {"agent": ${agent}}, agent_record {"agent_id": ${agent}} and score_of {"agent_id": ${agent}}.`,
       `2. ${SCORE_FACTS}`,
       "3. Write in Markdown:",
-      "## Scores now: the on-chain score and Priors Score v2 with its rung, and the snapshot time.",
+      "## Scores now: the pool score and Priors Score v2 with its rung, and the snapshot time.",
       "## Why: for each score, the components that carry it and those at zero, from the agent's own figures (loans repaid and qualified, USDG repaid, line and backing, days on Priors, late repayments); mark every figure you estimate.",
-      "## What lifts it: the next steps in order of effect, each with what it adds (e.g. a loan held 7+ days and repaid on time: +20 on chain while under the 200 cap), the next rung's needs from scoreV2.next, and what would cost points (a late repayment, a default).",
+      "## What lifts it: the next steps in order of effect, each with what it adds (e.g. a loan held 7+ days and repaid on time: +20 to the pool score while under the 200 cap), the next rung's needs from scoreV2.next, and what would cost points (a late repayment, a default).",
       `If agent #${agent} has no Priors record, say so, and where its first points would come from.`,
     ].join("\n"),
   },
